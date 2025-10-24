@@ -77,7 +77,7 @@ print(f"  flashpack: {np.mean(times_fp):.3f}")
 # Plot configuration (aligned with scripts/plot-benchmark.py)
 accelerate_color = "#0f5ef3"
 flashpack_color = "#adff02"
-label_color = "#eeeeee"
+label_color = "#111111"
 
 labels = [
     "pytorch",
@@ -90,13 +90,6 @@ means = [
     float(np.mean(times_sf)),
     float(np.mean(times_sf_fast)),
     float(np.mean(times_fp)),
-]
-
-means = [
-    0.352,
-    0.130,
-    0.122,
-    0.049,
 ]
 
 colors = [accelerate_color, accelerate_color, accelerate_color, flashpack_color]
