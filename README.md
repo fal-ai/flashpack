@@ -79,12 +79,3 @@ model = nn.Module(...)
 pack_to_file(model, flashpack_path)  # write state dict to file
 assign_from_file(model, flashpack_path)  # load state dict from file
 ```
-
-
-
-
-
-
-
-
-
