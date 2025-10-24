@@ -75,8 +75,8 @@ print(f"  safetensors (fast gpu): {np.mean(times_sf_fast):.3f}")
 print(f"  flashpack: {np.mean(times_fp):.3f}")
 
 # Plot configuration (aligned with scripts/plot-benchmark.py)
-accelerate_color = "#1f0455"
-flashpack_color = "#e2fea1"
+accelerate_color = "#0f5ef3"
+flashpack_color = "#adff02"
 label_color = "#eeeeee"
 
 labels = [
@@ -120,7 +120,7 @@ ax.invert_yaxis()  # top-to-bottom order as specified
 
 ax.set_xlabel("Loading Time (seconds)", fontsize=12, fontweight="bold", color=label_color)
 ax.set_title(
-    "Model Loading Time Comparison (10 runs)",
+    "load_state_dict() Time Comparison",
     fontsize=14,
     fontweight="bold",
     pad=16,
