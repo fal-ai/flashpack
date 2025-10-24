@@ -1,17 +1,17 @@
 <div align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal/flashpack/blob/main/media/flashpack-logo-white.png?raw=true">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal/flashpack/blob/main/media/flashpack-logo-black.png?raw=true">
-  <img alt="FlashPack Logo" src="https://github.com/painebenjamin/flatpack/blob/main/media/flashpack-logo-white.png?raw=true">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/flashpack-logo-white.png?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/flashpack-logo-black.png?raw=true">
+  <img alt="FlashPack Logo" src="https://github.com/fal-ai/flashpack/blob/main/media/flashpack-logo-white.png?raw=true">
 </picture>
 <h2>Disk-to-GPU Tensor loading at up to 25Gbps without GDS</h2>
 </div>
 
 <div align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal/flashpack/blob/main/media/benchmark-white.png?raw=true">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal/flashpack/blob/main/media/benchmark-black.png?raw=true">
-  <img alt="Benchmark Results" src="https://github.com/painebenjamin/flatpack/blob/main/media/benchmark-white.png?raw=true">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/benchmark-white.png?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/benchmark-black.png?raw=true">
+  <img alt="Benchmark Results" src="https://github.com/fal-ai/flashpack/blob/main/media/benchmark-white.png?raw=true">
 </picture>
 </div>
 
@@ -79,6 +79,7 @@ model = nn.Module(...)
 pack_to_file(model, flashpack_path)  # write state dict to file
 assign_from_file(model, flashpack_path)  # load state dict from file
 ```
+
 
 
 
