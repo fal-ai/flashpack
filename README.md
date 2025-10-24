@@ -1,13 +1,17 @@
 <div align="center">
-<img src="https://github.com/painebenjamin/flatpack/blob/main/media/flashpack.png?raw=true" width="480" />
-<h2>Distributed-Friendly Disk-to-GPU Tensor loading at up to 25Gbps</h2>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal/flashpack/blob/main/media/flashpack-logo-white.png?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal/flashpack/blob/main/media/flashpack-logo-black.png?raw=true">
+  <img alt="FlashPack Logo" src="https://github.com/painebenjamin/flatpack/blob/main/media/flashpack-logo-white.png?raw=true">
+</picture>
+<h2>Disk-to-GPU Tensor loading at up to 25Gbps without GDS</h2>
 </div>
 
 <div align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/painebenjamin/flatpack/blob/main/media/benchmark-dark.png?raw=true">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/painebenjamin/flatpack/blob/main/media/benchmark-light.png?raw=true">
-  <img alt="Benchmark Results" src="https://github.com/painebenjamin/flatpack/blob/main/media/benchmark-dark.png?raw=true">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal/flashpack/blob/main/media/benchmark-white.png?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal/flashpack/blob/main/media/benchmark-black.png?raw=true">
+  <img alt="Benchmark Results" src="https://github.com/painebenjamin/flatpack/blob/main/media/benchmark-white.png?raw=true">
 </picture>
 </div>
 
@@ -44,6 +48,9 @@ pipeline.save_pretrained_flashpack(
     "some_directory",
     push_to_hub=False,  # pass repo_id when using this
 )
+
+# Load directly from flashpack directory or repository
+pipeline = FlashPackMyPipeline.from_pretrained_flashpack("my/flashpack-repository")
 ```
 
 ### Vanilla PyTorch
@@ -72,6 +79,8 @@ model = nn.Module(...)
 pack_to_file(model, flashpack_path)  # write state dict to file
 assign_from_file(model, flashpack_path)  # load state dict from file
 ```
+
+
 
 
 
