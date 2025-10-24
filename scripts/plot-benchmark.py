@@ -8,9 +8,9 @@ import numpy as np
 import pandas as pd
 
 # configuration
-accelerate_color = "#1f0455"
-flashpack_color = "#e2fea1"
-label_color = "#eeeeee"
+accelerate_color = "#0f5ef3"
+flashpack_color = "#adff02"
+label_color = "#111111"
 model_labels = {
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": "Wan2.1 1.3B DiT",
     "Wan-AI/Wan2.1-T2V-14B-Diffusers": "Wan2.1 14B DiT",
