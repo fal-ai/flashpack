@@ -1,0 +1,49 @@
+[build-system]
+requires = [
+    "setuptools>=80",
+    "setuptools-scm>=8",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashpack"
+dynamic = ["version"]
+description = "Load ML models fast"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "fal-ai-community"}
+]
+dependencies = [
+    "accelerate>=1.10.1",
+    "click>=8.3.0",
+    "safetensors>=0.6.2",
+    "torch>=2.8.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+flashpack = "flashpack.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.1",
+    "pre-commit>=3.0.0",
+    "setuptools-scm>=9.2.0",
+]
+
+[tool.setuptools_scm]
+write_to = "src/flashpack/version.py"
