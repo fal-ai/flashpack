@@ -19,7 +19,7 @@
 <div align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/load-state-dict-comparison-white.png?raw=true">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/load-state-dict-comparison-black?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/load-state-dict-comparison-black.png?raw=true">
   <img alt="Benchmark Results" src="https://github.com/fal-ai/flashpack/blob/main/media/load-state-dict-comparison-black.png?raw=true">
 </picture>
 <em>Run this benchmark in `tests/test_speed_comparison.py`</em>
