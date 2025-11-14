@@ -18,6 +18,7 @@ from .serialization import pack_to_file
 
 class FlashPackMixin:
 
+    flashpack_coerce_dtype: bool = False
     flashpack_init_method: str | None = None
     flashpack_ignore_names: list[str] | None = None
     flashpack_ignore_prefixes: list[str] | None = None
@@ -43,6 +44,7 @@ class FlashPackMixin:
         rank: int | None = None,
         local_rank: int | None = None,
         world_size: int | None = None,
+        coerce_dtype: bool = False,
         **kwargs: Any,
     ) -> FlashPackMixin:
         """
@@ -90,6 +92,7 @@ class FlashPackMixin:
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
+            coerce_dtype=coerce_dtype or cls.flashpack_coerce_dtype,
         )
         return model
 

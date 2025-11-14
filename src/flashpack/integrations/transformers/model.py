@@ -110,6 +110,7 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         rank: int | None = None,
         local_rank: int | None = None,
         world_size: int | None = None,
+        coerce_dtype: bool = False,
         **kwargs: Any,
     ) -> FlashPackTransformersModelMixin:
         """
@@ -184,5 +185,6 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
             local_rank=local_rank,
             world_size=world_size,
             use_distributed_loading=use_distributed_loading,
+            coerce_dtype=coerce_dtype,
             **kwargs,
         )

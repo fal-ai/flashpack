@@ -247,6 +247,7 @@ class FlashPackDiffusionPipeline(DiffusionPipeline):
         ignore_prefixes: list[str] | None = None,
         silent: bool = True,
         use_distributed_loading: bool = False,
+        coerce_dtype: bool = False,
         **kwargs: Any,
     ) -> Self:
         """
@@ -612,6 +613,7 @@ class FlashPackDiffusionPipeline(DiffusionPipeline):
                         rank=rank,
                         local_rank=local_rank,
                         world_size=world_size,
+                        coerce_dtype=coerce_dtype,
                     )
                 except Exception as e:
                     raise RuntimeError(
@@ -718,6 +720,7 @@ def load_sub_model_flashpack(
     rank: int | None = None,
     local_rank: int | None = None,
     world_size: int | None = None,
+    coerce_dtype: bool = False,
 ) -> Any:
     """
     Helper method to load the module `name` from `library_name` and `class_name`.
@@ -764,6 +767,7 @@ def load_sub_model_flashpack(
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
+            coerce_dtype=coerce_dtype,
         ).to(device)
 
     load_method_name = None
