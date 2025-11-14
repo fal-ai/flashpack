@@ -105,6 +105,7 @@ class FlashPackDiffusersModelMixin(ModelMixin, FlashPackMixin):
         rank: int | None = None,
         local_rank: int | None = None,
         world_size: int | None = None,
+        coerce_dtype: bool = False,
         **kwargs: Any,
     ) -> FlashPackDiffusersModelMixin:
         """
@@ -186,5 +187,6 @@ class FlashPackDiffusersModelMixin(ModelMixin, FlashPackMixin):
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
+            coerce_dtype=coerce_dtype,
             **kwargs,
         )

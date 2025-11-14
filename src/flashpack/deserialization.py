@@ -248,6 +248,7 @@ def assign_from_file(
     rank: int | None = None,
     local_rank: int | None = None,
     world_size: int | None = None,
+    coerce_dtype: bool = False,
 ) -> None:
     """
     Assign the weights from a flashpack file to a model.
@@ -337,9 +338,12 @@ def assign_from_file(
                             f"Expected Tensor buffer at '{name}', got {type(old_buf)}"
                         )
                     if old_buf.dtype != target_dtype:
-                        raise TypeError(
-                            f"dtype mismatch for buffer '{name}': model={old_buf.dtype} vs flash={target_dtype}."
-                        )
+                        if coerce_dtype:
+                            view = view.to(old_buf.dtype)
+                        else:
+                            raise TypeError(
+                                f"dtype mismatch for buffer '{name}': model={old_buf.dtype} vs flash={target_dtype}."
+                            )
                     module._buffers[attr] = view
                     assigned_buffer_names.append(name)
                 else:
