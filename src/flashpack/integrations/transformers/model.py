@@ -165,6 +165,7 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
             proxies=proxies,
         )
 
+        kwargs.update(model_kwargs)
         return cls.from_flashpack(
             flashpack_path,
             config,
@@ -183,5 +184,5 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
             local_rank=local_rank,
             world_size=world_size,
             use_distributed_loading=use_distributed_loading,
-            **model_kwargs,
+            **kwargs,
         )
