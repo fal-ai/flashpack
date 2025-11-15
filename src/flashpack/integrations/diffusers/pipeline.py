@@ -4,12 +4,12 @@ import os
 import sys
 import warnings
 from typing import Any
-from typing_extensions import Self
 
 import torch
 import torch.distributed as dist
 from huggingface_hub import DDUFEntry, create_repo, read_dduf_file, snapshot_download
 from packaging import version
+from typing_extensions import Self
 
 from diffusers import OnnxRuntimeModel
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT, ModelMixin
@@ -105,6 +105,7 @@ class FlashPackDiffusionPipeline(DiffusionPipeline):
         align_bytes: int = DEFAULT_ALIGN_BYTES,
         silent: bool = True,
         num_workers: int = DEFAULT_NUM_WRITE_WORKERS,
+        target_dtype: torch.dtype | dict[str, torch.dtype] | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -139,21 +140,21 @@ class FlashPackDiffusionPipeline(DiffusionPipeline):
             sub_model_dir = os.path.join(save_directory, pipeline_component_name)
             model_cls = sub_model.__class__
 
+            sub_model_target_dtype = (
+                target_dtype.get(pipeline_component_name, None)
+                if isinstance(target_dtype, dict)
+                else target_dtype
+            )
+
             if isinstance(
                 sub_model,
                 (FlashPackDiffusersModelMixin, FlashPackTransformersModelMixin),
             ):
                 os.makedirs(sub_model_dir, exist_ok=True)
-                target_dtype = getattr(sub_model, "dtype", None)
-                if target_dtype is None:
-                    try:
-                        target_dtype = next(iter(sub_model.parameters())).dtype
-                    except StopIteration:
-                        pass
                 sub_model.save_pretrained_flashpack(
                     sub_model_dir,
                     is_main_process=is_main_process,
-                    target_dtype=target_dtype,
+                    target_dtype=sub_model_target_dtype,
                     align_bytes=align_bytes,
                     silent=silent,
                     num_workers=num_workers,

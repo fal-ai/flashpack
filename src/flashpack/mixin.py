@@ -99,7 +99,7 @@ class FlashPackMixin:
     def save_flashpack(
         self,
         destination_path: str,
-        target_dtype: torch.dtype,
+        target_dtype: torch.dtype | None = None,
         name_order: list[str] | None = None,
         align_bytes: int = DEFAULT_ALIGN_BYTES,
         silent: bool = False,
