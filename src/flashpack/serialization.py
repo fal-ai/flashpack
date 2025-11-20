@@ -214,6 +214,12 @@ def pack_to_file(
                 except OSError:
                     pass
 
+        # Explicitly close memory map
+        # `_mmap` in numpy <= 1.25, `base` in numpy >= 1.26
+        mm_base = getattr(mm, "_mmap", None) or getattr(mm, "base", None)
+        if mm_base is not None:
+            mm_base.close()
+
         # Atomic replace
         with timer("atomic_rename", silent):
             os.replace(tmp_path, destination_path)
