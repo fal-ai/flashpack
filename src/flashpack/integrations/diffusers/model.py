@@ -53,7 +53,7 @@ class FlashPackDiffusersModelMixin(ModelMixin, FlashPackMixin):
 
         self.save_flashpack(
             model_path,
-            target_dtype=target_dtype or self.dtype,
+            target_dtype=target_dtype,
             align_bytes=align_bytes,
             silent=silent,
             num_workers=num_workers,

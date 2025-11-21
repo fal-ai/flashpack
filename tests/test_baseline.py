@@ -5,7 +5,51 @@ import tempfile
 import torch
 import tqdm
 from flashpack import FlashPackMixin
+from flashpack.constants import FILE_FORMAT_V4
+from flashpack.deserialization import assign_from_file, get_flashpack_file_metadata
+from flashpack.serialization import pack_to_file
 from flashpack.utils import timer
+
+
+def test_mixed_dtype_roundtrip(tmp_path) -> None:
+    """
+    Ensure checkpoints with multiple dtypes roundtrip via macroblocks.
+    """
+
+    class MixedDTypeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.float_param = torch.nn.Parameter(torch.randn(4, dtype=torch.float32))
+            self.bfloat_param = torch.nn.Parameter(torch.randn(3, dtype=torch.bfloat16))
+            self.register_buffer("int_buffer", torch.arange(6, dtype=torch.int16))
+
+    torch.manual_seed(0)
+    source = MixedDTypeModel()
+    torch.manual_seed(1)
+    destination = MixedDTypeModel()
+    path = tmp_path / "mixed.flashpack"
+
+    pack_to_file(
+        source.state_dict(),
+        destination_path=str(path),
+        target_dtype=None,
+        silent=True,
+    )
+
+    meta = get_flashpack_file_metadata(str(path))
+    assert meta["format"] == FILE_FORMAT_V4
+    assert len(meta["macroblocks"]) == 3
+
+    assign_from_file(destination, str(path), device="cpu", silent=True)
+
+    source_state = source.state_dict()
+    loaded_state = destination.state_dict()
+    for name, tensor in source_state.items():
+        assert name in loaded_state
+        loaded = loaded_state[name]
+        assert loaded.dtype == tensor.dtype
+        assert torch.equal(loaded, tensor)
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

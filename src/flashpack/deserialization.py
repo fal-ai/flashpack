@@ -3,6 +3,7 @@ import math
 import os
 import warnings
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,7 @@ from .constants import (
     DEFAULT_CHUNK_BYTES,
     DEFAULT_NUM_STREAMS,
     FILE_FORMAT_V3,
+    FILE_FORMAT_V4,
     MAGIC,
     U64LE,
 )
@@ -25,6 +27,32 @@ from .utils import (
     timer,
     torch_dtype_to_numpy_dtype,
 )
+
+
+@dataclass
+class MacroblockSpec:
+    dtype: torch.dtype
+    offset_bytes: int
+    length_bytes: int
+    length_elems: int
+
+
+@dataclass
+class FlashTensorStorage:
+    blocks: list[torch.Tensor]
+    backing_arrays: list[np.memmap] | None = None
+
+    def block(self, idx: int) -> torch.Tensor:
+        return self.blocks[idx]
+
+    def __len__(self) -> int:
+        return len(self.blocks)
+
+    @property
+    def device(self) -> torch.device:
+        if not self.blocks:
+            return torch.device("cpu")
+        return self.blocks[0].device
 
 
 def get_flashpack_file_metadata(path: str) -> dict[str, Any]:
@@ -49,8 +77,9 @@ def get_flashpack_file_metadata(path: str) -> dict[str, Any]:
 
         f.seek(start)
         meta = json.loads(f.read(json_len).decode("utf-8"))
-        if meta.get("format") != FILE_FORMAT_V3:
-            raise ValueError(f"Unexpected format: {meta.get('format')}")
+        fmt = meta.get("format")
+        if fmt not in (FILE_FORMAT_V3, FILE_FORMAT_V4):
+            raise ValueError(f"Unexpected format: {fmt}")
 
         return meta
 
@@ -66,130 +95,213 @@ def is_flashpack_file(path: str) -> bool:
         return False
 
 
+def _ensure_index_macroblocks(meta: dict[str, Any], num_blocks: int) -> None:
+    index = meta.get("index", [])
+    for rec in index:
+        block_id = rec.get("macroblock")
+        if block_id is None:
+            block_id = 0
+            rec["macroblock"] = block_id
+        block_id = int(block_id)
+        if block_id < 0 or block_id >= num_blocks:
+            raise ValueError(
+                f"Index entry references macroblock {block_id}, but only {num_blocks} blocks exist."
+            )
+
+
+def _build_macroblock_specs(meta: dict[str, Any]) -> list[MacroblockSpec]:
+    fmt = meta.get("format")
+    specs: list[MacroblockSpec] = []
+    if fmt == FILE_FORMAT_V3:
+        dtype = string_to_dtype(meta["target_dtype"])
+        total_elems = int(meta["total_elems"])
+        elem_sz = torch.tensor([], dtype=dtype).element_size()
+        specs.append(
+            MacroblockSpec(
+                dtype=dtype,
+                offset_bytes=0,
+                length_bytes=total_elems * elem_sz,
+                length_elems=total_elems,
+            )
+        )
+    elif fmt == FILE_FORMAT_V4:
+        macroblocks = meta.get("macroblocks")
+        if not macroblocks:
+            raise ValueError("Missing macroblock metadata for flashpack v4 file.")
+        for block in macroblocks:
+            dtype = string_to_dtype(block["dtype"])
+            specs.append(
+                MacroblockSpec(
+                    dtype=dtype,
+                    offset_bytes=int(block["offset_bytes"]),
+                    length_bytes=int(block["length_bytes"]),
+                    length_elems=int(block["length_elems"]),
+                )
+            )
+    else:
+        raise ValueError(f"Unsupported flashpack format: {fmt}")
+
+    _ensure_index_macroblocks(meta, len(specs))
+    return specs
+
+
+def _madvise_memmap(mm: np.memmap) -> None:
+    try:
+        import mmap as mmap_module
+
+        mm._mmap.madvise(mmap_module.MADV_WILLNEED)
+        mm._mmap.madvise(mmap_module.MADV_SEQUENTIAL)
+    except Exception:
+        pass
+
+
+def _open_memmaps(path: str, specs: list[MacroblockSpec]) -> list[np.memmap]:
+    memmaps = []
+    for spec in specs:
+        np_dtype = torch_dtype_to_numpy_dtype(spec.dtype)
+        mm = np.memmap(
+            path,
+            dtype=np_dtype,
+            mode="r",
+            offset=spec.offset_bytes,
+            shape=(spec.length_elems,),
+        )
+        _madvise_memmap(mm)
+        memmaps.append(mm)
+    return memmaps
+
+
+def _cpu_storage_from_memmaps(
+    memmaps: list[np.memmap], specs: list[MacroblockSpec]
+) -> FlashTensorStorage:
+    blocks: list[torch.Tensor] = []
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        for mm, spec in zip(memmaps, specs):
+            tensor = torch.from_numpy(mm)
+            if spec.dtype == torch.bfloat16:
+                tensor = tensor.view(torch.bfloat16)
+            blocks.append(tensor)
+    return FlashTensorStorage(blocks=blocks, backing_arrays=memmaps)
+
+
+def _copy_memmaps_into_storage(
+    memmaps: list[np.memmap],
+    specs: list[MacroblockSpec],
+    storage: FlashTensorStorage,
+    device: torch.device,
+    chunk_bytes: int,
+    num_streams: int,
+) -> None:
+    for idx, (mm, spec) in enumerate(zip(memmaps, specs)):
+        total_elems = spec.length_elems
+        elem_sz = torch.tensor([], dtype=spec.dtype).element_size()
+        total_bytes = total_elems * elem_sz
+
+        target_num_chunks = 150
+        optimal_chunk_bytes = max(chunk_bytes, total_bytes // max(target_num_chunks, 1))
+        optimal_chunk_bytes = min(optimal_chunk_bytes, 64 * 1024 * 1024)
+        elems_per_chunk = max(1, (optimal_chunk_bytes // max(elem_sz, 1)))
+        n_chunks = (total_elems + elems_per_chunk - 1) // elems_per_chunk
+
+        block_tensor = storage.block(idx)
+        num_pipeline_buffers = max(1, min(num_streams, 8))
+        staging_bufs = [
+            torch.empty(elems_per_chunk, dtype=spec.dtype, pin_memory=True)
+            for _ in range(num_pipeline_buffers)
+        ]
+        num_cuda_streams = max(1, min(num_streams, 8))
+        streams = [torch.cuda.Stream(device=device) for _ in range(num_cuda_streams)]
+
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * elems_per_chunk
+            end = min(total_elems, start + elems_per_chunk)
+            sz = end - start
+
+            buf_idx = chunk_idx % num_pipeline_buffers
+            buf = staging_bufs[buf_idx].narrow(0, 0, sz)
+            stream = streams[chunk_idx % num_cuda_streams]
+
+            if chunk_idx >= num_pipeline_buffers:
+                stream.synchronize()
+
+            np_view = mm[start:end]
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning)
+                src_t = torch.from_numpy(np_view)
+            if src_t.dtype != spec.dtype:
+                src_t = src_t.to(dtype=spec.dtype)
+            buf.copy_(src_t, non_blocking=False)
+
+            with torch.cuda.stream(stream):
+                block_tensor.narrow(0, start, sz).copy_(buf, non_blocking=True)
+
+        torch.cuda.synchronize(device)
+    return None
+
+
+def _allocate_empty_storage(
+    specs: list[MacroblockSpec], device: torch.device
+) -> FlashTensorStorage:
+    blocks = [
+        torch.empty(spec.length_elems, dtype=spec.dtype, device=device)
+        for spec in specs
+    ]
+    return FlashTensorStorage(blocks=blocks)
+
+
+def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
+    for block in storage.blocks:
+        dist.broadcast(block, src=src)
+
+
 def read_flashpack_file(
     path: str,
     device: str | torch.device = "cpu",
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     num_streams: int = DEFAULT_NUM_STREAMS,
     silent: bool = True,
-) -> tuple[torch.Tensor, dict[str, Any]]:
+    metadata: dict[str, Any] | None = None,
+) -> tuple[FlashTensorStorage, dict[str, Any]]:
     """
-    Read the flashpack file and return the tensor and metadata.
+    Read the flashpack file and return the macroblock storage and metadata.
     """
     with timer("read_metadata", silent):
-        meta = get_flashpack_file_metadata(path)
+        meta = metadata or get_flashpack_file_metadata(path)
 
+    specs = _build_macroblock_specs(meta)
     device = torch.device(device) if isinstance(device, str) else device
-    target_dtype = string_to_dtype(meta["target_dtype"])
-    total_elems = int(meta["total_elems"])
-    elem_sz = torch.tensor([], dtype=target_dtype).element_size()
 
     with timer("mmap_payload", silent):
-        np_dtype = torch_dtype_to_numpy_dtype(target_dtype)
-        mm = np.memmap(path, dtype=np_dtype, mode="r", shape=(total_elems,))
+        memmaps = _open_memmaps(path, specs)
 
-    # Fast CPU path
     if device.type == "cpu":
         with timer("cpu_from_memmap", silent):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                flash_cpu = (
-                    torch.from_numpy(mm)
-                    if target_dtype != torch.bfloat16
-                    else torch.from_numpy(mm.view(np.uint16)).view(torch.bfloat16)
-                )
-        return flash_cpu, meta
+            storage = _cpu_storage_from_memmaps(memmaps, specs)
+        return storage, meta
 
     if device.type != "cuda":
         raise ValueError(f"Unsupported device: {device}")
 
     with timer("alloc_device", silent):
-        if target_dtype == torch.bfloat16:
-            flash_dev = torch.empty(total_elems, dtype=torch.bfloat16, device=device)
-            flash_dev_u16 = flash_dev.view(torch.uint16)
-        else:
-            flash_dev = torch.empty(total_elems, dtype=target_dtype, device=device)
-            flash_dev_u16 = None
-
-    # Advise kernel to read ahead (Linux only)
-    try:
-        import mmap as mmap_module
-
-        # MADV_WILLNEED: tell kernel we'll need this data
-        # MADV_SEQUENTIAL: we'll read sequentially
-        mm._mmap.madvise(mmap_module.MADV_WILLNEED)
-        mm._mmap.madvise(mmap_module.MADV_SEQUENTIAL)
-    except:
-        pass
-
-    # Tune chunk size for the specific file
-    total_bytes = total_elems * elem_sz
-
-    # aim for 100-200 chunks total for good pipelining
-    target_num_chunks = 150
-    optimal_chunk_bytes = max(chunk_bytes, total_bytes // target_num_chunks)
-    # But cap at 64MB to avoid too much staging memory
-    optimal_chunk_bytes = min(optimal_chunk_bytes, 64 * 1024 * 1024)
-
-    elems_per_chunk = max(1, (optimal_chunk_bytes // elem_sz))
-    n_chunks = (total_elems + elems_per_chunk - 1) // elems_per_chunk
+        storage = _allocate_empty_storage(specs, device)
 
     with timer("read_and_copy", silent):
-        # Pre-allocate a small number of pinned staging buffers for pipelining
-        num_pipeline_buffers = min(num_streams, 8)  # Don't over-allocate
-        dt = torch.uint16 if target_dtype == torch.bfloat16 else target_dtype
-        staging_bufs = [
-            torch.empty(elems_per_chunk, dtype=dt, pin_memory=True)
-            for _ in range(num_pipeline_buffers)
-        ]
+        _copy_memmaps_into_storage(
+            memmaps,
+            specs,
+            storage,
+            device=device,
+            chunk_bytes=chunk_bytes,
+            num_streams=num_streams,
+        )
 
-        # Pre-allocate streams
-        streams = [torch.cuda.Stream(device=device) for _ in range(min(num_streams, 8))]
-
-        # Pipeline: fill first buffer, then alternate fill/copy
-        for chunk_idx in range(n_chunks):
-            start = chunk_idx * elems_per_chunk
-            end = min(total_elems, start + elems_per_chunk)
-            sz = end - start
-
-            # Select staging buffer (round-robin)
-            buf_idx = chunk_idx % num_pipeline_buffers
-            buf = staging_bufs[buf_idx].narrow(0, 0, sz)
-
-            # Select stream
-            stream = streams[chunk_idx % len(streams)]
-
-            # Wait for this buffer's previous use to complete
-            if chunk_idx >= num_pipeline_buffers:
-                stream.synchronize()
-
-            # Copy from mmap to staging (CPU)
-            np_view = mm[start:end]
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                src_t = (
-                    torch.from_numpy(np_view)
-                    if target_dtype != torch.bfloat16
-                    else torch.from_numpy(np_view.view(np.uint16))
-                )
-            buf.copy_(src_t, non_blocking=False)
-
-            # Copy to device (GPU) on the selected stream
-            with torch.cuda.stream(stream):
-                if target_dtype == torch.bfloat16:
-                    flash_dev_u16.narrow(0, start, sz).copy_(buf, non_blocking=True)
-                else:
-                    flash_dev.narrow(0, start, sz).copy_(buf, non_blocking=True)
-
-        # Final sync
-        torch.cuda.synchronize(device)
-
-    del mm
-    return flash_dev, meta
+    del memmaps
+    return storage, meta
 
 
 def iterate_from_flash_tensor(
-    flash_tensor: torch.Tensor,
+    flash_tensor: FlashTensorStorage | torch.Tensor,
     metadata: dict[str, Any],
     ignore_names: list[str] | None = None,
     ignore_prefixes: list[str] | None = None,
@@ -198,14 +310,36 @@ def iterate_from_flash_tensor(
     """
     Iterate over the tensors stored in the flash tensor.
     """
+    storage = (
+        flash_tensor
+        if isinstance(flash_tensor, FlashTensorStorage)
+        else FlashTensorStorage(blocks=[flash_tensor])
+    )
     index = metadata["index"]
 
     align_bytes = int(metadata.get("align_bytes", 0))
+    align_cache: dict[int, int] = {}
+
+    def _get_align(block_idx: int) -> int:
+        if not align_bytes:
+            return 0
+        if block_idx not in align_cache:
+            esz = storage.block(block_idx).element_size()
+            g = math.gcd(align_bytes, esz)
+            align_cache[block_idx] = align_bytes // g if g else 0
+        return align_cache[block_idx]
+
     if align_bytes:
-        esz = flash_tensor.element_size()
-        g = math.gcd(align_bytes, esz)
-        align_elems = align_bytes // g
-        bad = [rec for rec in index if (int(rec["offset"]) % align_elems) != 0]
+        bad: list[dict[str, Any]] = []
+        for rec in index:
+            block_idx = int(rec.get("macroblock", 0))
+            if block_idx < 0 or block_idx >= len(storage):
+                raise ValueError(
+                    f"Index entry references invalid macroblock {block_idx}."
+                )
+            align_elems = _get_align(block_idx)
+            if align_elems and (int(rec["offset"]) % align_elems) != 0:
+                bad.append(rec)
         if bad:
             names = ", ".join(r["name"] for r in bad[:3])
             raise ValueError(
@@ -220,9 +354,13 @@ def iterate_from_flash_tensor(
         shape = tuple(rec["shape"]) or (1,)
         off = int(rec["offset"])
         n = int(rec["length"])
+        block_idx = int(rec.get("macroblock", 0))
+        if block_idx < 0 or block_idx >= len(storage):
+            raise ValueError(f"Index entry references invalid macroblock {block_idx}.")
+        block_tensor = storage.block(block_idx)
 
         try:
-            view = flash_tensor.narrow(0, off, n).view(
+            view = block_tensor.narrow(0, off, n).view(
                 *shape
             )  # contiguous 1D slice -> reshaped
             yield name, view
@@ -271,24 +409,22 @@ def assign_from_file(
             world_size=world_size,
         )
         rank = dist.get_rank()
+        meta = get_flashpack_file_metadata(path)
+        specs = _build_macroblock_specs(meta)
         if rank == 0:
-            flash_tensor, meta = read_flashpack_file(
+            flash_storage, meta = read_flashpack_file(
                 path=path,
                 device=device,
                 silent=silent,
                 num_streams=num_streams,
                 chunk_bytes=chunk_bytes,
+                metadata=meta,
             )
         else:
-            meta = get_flashpack_file_metadata(path)
-            flash_tensor = torch.empty(
-                meta["total_elems"],
-                dtype=string_to_dtype(meta["target_dtype"]),
-                device=device,
-            )
-        dist.broadcast(flash_tensor, src=0)
+            flash_storage = _allocate_empty_storage(specs, device)
+        _broadcast_storage(flash_storage, src=0)
     else:
-        flash_tensor, meta = read_flashpack_file(
+        flash_storage, meta = read_flashpack_file(
             path=path,
             device=device,
             silent=silent,
@@ -297,10 +433,8 @@ def assign_from_file(
         )
 
     if keep_flash_ref_on_model:
-        setattr(model, "_flash_shared_storage", flash_tensor)
+        setattr(model, "_flash_shared_storage", flash_storage)
         setattr(model, "_flash_shared_storage_meta", meta)
-
-    target_dtype = string_to_dtype(meta["target_dtype"])
 
     with timer("build_lookups", silent):
         params = dict(model.named_parameters())
@@ -314,7 +448,7 @@ def assign_from_file(
     with timer("assign", silent):
         try:
             for name, view in iterate_from_flash_tensor(
-                flash_tensor, meta, ignore_names, ignore_prefixes, ignore_suffixes
+                flash_storage, meta, ignore_names, ignore_prefixes, ignore_suffixes
             ):
                 total_elements += view.numel()
 
@@ -337,12 +471,12 @@ def assign_from_file(
                         raise TypeError(
                             f"Expected Tensor buffer at '{name}', got {type(old_buf)}"
                         )
-                    if old_buf.dtype != target_dtype:
+                    if old_buf.dtype != view.dtype:
                         if coerce_dtype:
                             view = view.to(old_buf.dtype)
                         else:
                             raise TypeError(
-                                f"dtype mismatch for buffer '{name}': model={old_buf.dtype} vs flash={target_dtype}."
+                                f"dtype mismatch for buffer '{name}': model={old_buf.dtype} vs flash={view.dtype}."
                             )
                     module._buffers[attr] = view
                     assigned_buffer_names.append(name)
