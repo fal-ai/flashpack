@@ -19,9 +19,38 @@ def test_mixed_dtype_roundtrip(tmp_path) -> None:
     class MixedDTypeModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.float_param = torch.nn.Parameter(torch.randn(4, dtype=torch.float32))
-            self.bfloat_param = torch.nn.Parameter(torch.randn(3, dtype=torch.bfloat16))
-            self.register_buffer("int_buffer", torch.arange(6, dtype=torch.int16))
+            self.float_param = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.bfloat_param = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+            self.float16_param = torch.nn.Parameter(torch.zeros(2, dtype=torch.float16))
+            self.register_buffer("int8_buffer", torch.zeros(4, dtype=torch.int8))
+            self.register_buffer("uint8_buffer", torch.zeros(4, dtype=torch.uint8))
+            self.register_buffer("int16_buffer", torch.zeros(4, dtype=torch.int16))
+            self.register_buffer("uint16_buffer", torch.zeros(4, dtype=torch.uint16))
+            self.register_buffer("int32_buffer", torch.zeros(4, dtype=torch.int32))
+            self.register_buffer("uint32_buffer", torch.zeros(4, dtype=torch.uint32))
+            self.register_buffer("int64_buffer", torch.zeros(4, dtype=torch.int64))
+            self.register_buffer("uint64_buffer", torch.zeros(4, dtype=torch.uint64))
+            self.register_buffer(
+                "float8_buffer", torch.zeros(4, dtype=torch.float8_e4m3fn)
+            )
+            self.register_buffer(
+                "float8_fnuz_buffer", torch.zeros(4, dtype=torch.float8_e4m3fnuz)
+            )
+            self.register_buffer(
+                "float8_e5m2_buffer", torch.zeros(4, dtype=torch.float8_e5m2)
+            )
+            self.register_buffer(
+                "float8_e5m2_fnuz_buffer", torch.zeros(4, dtype=torch.float8_e5m2fnuz)
+            )
+            self.register_buffer(
+                "float8_e8m0fnu_buffer", torch.zeros(4, dtype=torch.float8_e8m0fnu)
+            )
+            self.register_buffer(
+                "complex64_buffer", torch.zeros(4, dtype=torch.complex64)
+            )
+            self.register_buffer(
+                "complex128_buffer", torch.zeros(4, dtype=torch.complex128)
+            )
 
     torch.manual_seed(0)
     source = MixedDTypeModel()
@@ -38,7 +67,7 @@ def test_mixed_dtype_roundtrip(tmp_path) -> None:
 
     meta = get_flashpack_file_metadata(str(path))
     assert meta["format"] == FILE_FORMAT_V4
-    assert len(meta["macroblocks"]) == 3
+    assert len(meta["macroblocks"]) == 18
 
     assign_from_file(destination, str(path), device="cpu", silent=True)
 

@@ -285,3 +285,30 @@ def convert_to_flashpack(
         silent,
         **kwargs,
     )
+
+
+def revert_from_flashpack(
+    path: str,
+    destination_path: str | None = None,
+    silent: bool = True,
+) -> str:
+    """
+    Reverts a flashpack file to a state dictionary.
+    """
+    from .deserialization import revert_from_file
+
+    state_dict = revert_from_file(path, silent=silent)
+    if not destination_path:
+        destination_path = path.replace(".flashpack", ".safetensors")
+
+    _, ext = os.path.splitext(destination_path)
+    if ext == ".safetensors":
+        from safetensors.torch import save_file
+
+        save_file(state_dict, destination_path)
+    else:
+        import torch
+
+        torch.save(state_dict, destination_path)
+
+    return destination_path

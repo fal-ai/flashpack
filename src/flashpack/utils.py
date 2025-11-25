@@ -11,6 +11,11 @@ import torch.distributed as dist
 
 logger = logging.getLogger("flashpack")
 
+try:
+    float4_e2m1fn = torch.float4_e2m1fn
+except AttributeError:
+    float4_e2m1fn = None  # type: ignore
+
 
 def maybe_init_distributed(
     rank: int | None = None,
@@ -70,21 +75,63 @@ def dtype_to_string(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[1]
 
 
+def get_packing_dtype(dtype: torch.dtype) -> torch.dtype:
+    """
+    Get the dtype to use for packing a given dtype.
+    """
+    if dtype is float4_e2m1fn:
+        raise ValueError(f"Unsupported dtype for packing: {dtype}")
+    elif dtype in [
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+        torch.float8_e8m0fnu,
+    ]:
+        return torch.uint8
+    elif dtype is torch.bfloat16:
+        return torch.uint16
+    elif dtype is torch.complex32:
+        return torch.uint32
+    else:
+        return dtype
+
+
 def torch_dtype_to_numpy_dtype(dtype: torch.dtype) -> np.dtype:
     """
     Convert a torch.dtype to a numpy.dtype.
     """
+    if dtype is float4_e2m1fn:
+        raise ValueError(
+            "4-bit data types are not supported at this time due to NumPy not having a similar 4-bit dtype. "
+            "If you feel up to tackling the task of supporting this, an idea is to combine 2 4-bit values "
+            "into a single 8-bit value and use that as the payload, then un-do this in the deserialization step. "
+            "Please feel free to contribute a PR if you're interested in adding support for this!"
+        )
+
     mapping = {
         torch.float32: np.float32,
         torch.float64: np.float64,
         torch.float16: np.float16,
-        torch.bfloat16: np.uint16,  # store raw bf16 bits as uint16 payload
         torch.int8: np.int8,
-        torch.uint8: np.uint8,
         torch.int16: np.int16,
         torch.int32: np.int32,
         torch.int64: np.int64,
+        torch.uint8: np.uint8,
+        torch.uint16: np.uint16,
+        torch.uint32: np.uint32,
+        torch.uint64: np.uint64,
         torch.bool: np.bool_,
+        torch.complex64: np.complex64,
+        torch.complex128: np.complex128,
+        # unsupported dtypes, we map to uints
+        torch.float8_e4m3fn: np.uint8,
+        torch.float8_e4m3fnuz: np.uint8,
+        torch.float8_e5m2: np.uint8,
+        torch.float8_e5m2fnuz: np.uint8,
+        torch.float8_e8m0fnu: np.uint8,
+        torch.bfloat16: np.uint16,
+        torch.complex32: np.uint32,
     }
     if dtype not in mapping:
         raise ValueError(f"Unsupported dtype for packing: {dtype}")

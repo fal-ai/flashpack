@@ -20,6 +20,7 @@ from .constants import (
 )
 from .utils import (
     get_module_and_attribute,
+    get_packing_dtype,
     human_num_elements,
     is_ignored_tensor_name,
     maybe_init_distributed,
@@ -179,8 +180,9 @@ def _cpu_storage_from_memmaps(
         warnings.filterwarnings("ignore", category=UserWarning)
         for mm, spec in zip(memmaps, specs):
             tensor = torch.from_numpy(mm)
-            if spec.dtype == torch.bfloat16:
-                tensor = tensor.view(torch.bfloat16)
+            packing_dtype = get_packing_dtype(spec.dtype)
+            if spec.dtype != packing_dtype:
+                tensor = tensor.view(spec.dtype)
             blocks.append(tensor)
     return FlashTensorStorage(blocks=blocks, backing_arrays=memmaps)
 
@@ -368,6 +370,20 @@ def iterate_from_flash_tensor(
             raise ValueError(f"Could not get tensor for record {rec}") from e
 
 
+def revert_from_file(
+    path: str,
+    silent: bool = True,
+) -> dict[str, torch.Tensor]:
+    """
+    Revert a flashpack file to a state dictionary.
+    """
+    storage, meta = read_flashpack_file(path, silent=silent)
+    state_dict = {}
+    for name, view in iterate_from_flash_tensor(storage, meta):
+        state_dict[name] = view.detach().cpu()
+    return state_dict
+
+
 def assign_from_file(
     model: torch.nn.Module,
     path: str,
@@ -375,7 +391,7 @@ def assign_from_file(
     strict: bool | None = None,
     strict_params: bool = True,
     strict_buffers: bool = False,
-    keep_flash_ref_on_model: bool = True,
+    keep_flash_ref_on_model: bool = False,
     silent: bool = True,
     num_streams: int = DEFAULT_NUM_STREAMS,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,

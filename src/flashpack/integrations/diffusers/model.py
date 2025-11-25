@@ -5,12 +5,11 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-import torch
-from huggingface_hub import create_repo, snapshot_download
-
 import diffusers
+import torch
 from diffusers import ModelMixin
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from huggingface_hub import create_repo, snapshot_download
 
 from ... import __version__
 from ...constants import (
@@ -42,7 +41,9 @@ class FlashPackDiffusersModelMixin(ModelMixin, FlashPackMixin):
         private: bool | None = None,
         **kwargs: Any,
     ) -> None:
-        if not os.path.isdir(save_directory):
+        if not os.path.exists(save_directory):
+            os.makedirs(save_directory)
+        elif not os.path.isdir(save_directory):
             raise ValueError(f"Save directory {save_directory} is not a directory")
 
         model_path = os.path.join(save_directory, "model.flashpack")
@@ -114,7 +115,9 @@ class FlashPackDiffusersModelMixin(ModelMixin, FlashPackMixin):
         device = (
             torch.device(device)
             if isinstance(device, str)
-            else torch.device("cpu") if device is None else device
+            else torch.device("cpu")
+            if device is None
+            else device
         )
 
         user_agent = {

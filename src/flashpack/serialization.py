@@ -16,7 +16,7 @@ from .constants import (
     MAGIC,
     U64LE,
 )
-from .utils import dtype_to_string, timer, torch_dtype_to_numpy_dtype
+from .utils import dtype_to_string, get_packing_dtype, timer, torch_dtype_to_numpy_dtype
 
 
 @dataclass
@@ -174,10 +174,7 @@ def pack_to_file(
                     block.offset_bytes : block.offset_bytes + block.length_bytes
                 ]
                 np_dtype = torch_dtype_to_numpy_dtype(block.dtype)
-                if block.dtype == torch.bfloat16:
-                    typed_view = block_slice.view(np.uint16)
-                else:
-                    typed_view = block_slice.view(np_dtype)
+                typed_view = block_slice.view(np_dtype)
                 block_numpy_views.append(typed_view)
                 block_views.append(torch.from_numpy(typed_view))
 
@@ -202,16 +199,18 @@ def pack_to_file(
                     block = macroblocks[rec.macroblock]
                     dst_block = block_views[rec.macroblock]
                     src = state_dict[rec.name]
-                    target = block.dtype
-                    if target == torch.bfloat16:
-                        src_cpu = src.view(-1).to(dtype=target, device="cpu")
-                        src_bits = src_cpu.view(torch.uint16)
+                    target_dtype = block.dtype
+                    packing_dtype = get_packing_dtype(target_dtype)
+
+                    if target_dtype != packing_dtype:
+                        src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
+                        src_bits = src_cpu.view(packing_dtype)
                         dst = dst_block.narrow(0, rec.offset, rec.length).view(
-                            torch.uint16
+                            packing_dtype
                         )
                         dst.copy_(src_bits, non_blocking=False)
                     else:
-                        src_cpu = src.view(-1).to(dtype=target, device="cpu")
+                        src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
                         dst = dst_block.narrow(0, rec.offset, rec.length)
                         dst.copy_(src_cpu, non_blocking=False)
 
@@ -238,16 +237,18 @@ def pack_to_file(
                     block = macroblocks[rec.macroblock]
                     dst_block = block_views[rec.macroblock]
                     src = state_dict[rec.name]
+                    target_dtype = block.dtype
+                    packing_dtype = get_packing_dtype(target_dtype)
 
-                    if block.dtype == torch.bfloat16:
-                        src_cpu = src.view(-1).to(dtype=block.dtype, device="cpu")
-                        src_bits = src_cpu.view(torch.uint16)
+                    if target_dtype != packing_dtype:
+                        src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
+                        src_bits = src_cpu.view(packing_dtype)
                         dst = dst_block.narrow(0, rec.offset, rec.length).view(
-                            torch.uint16
+                            packing_dtype
                         )
                         dst.copy_(src_bits, non_blocking=False)
                     else:
-                        src_cpu = src.view(-1).to(dtype=block.dtype, device="cpu")
+                        src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
                         dst = dst_block.narrow(0, rec.offset, rec.length)
                         dst.copy_(src_cpu, non_blocking=False)
 

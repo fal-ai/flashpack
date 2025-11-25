@@ -5,7 +5,7 @@ import traceback
 import click
 
 from . import __version__
-from .commands import convert_to_flashpack
+from .commands import convert_to_flashpack, revert_from_flashpack
 from .constants import FILE_FORMAT_V3, FILE_FORMAT_V4
 from .deserialization import get_flashpack_file_metadata
 from .integrations import patch_integrations
@@ -184,6 +184,32 @@ def convert(
             use_diffusers=use_diffusers,
             subfolder=subfolder,
             variant=variant,
+            silent=not verbose,
+        )
+        print(green(f"Success: Saved to {os.path.abspath(result_path)}"))
+    except Exception as e:
+        print(red(f"Error: {e}"))
+        if verbose:
+            traceback.print_exc()
+        exit(1)
+
+
+@main.command(name="revert")
+@click.argument("path", type=click.Path(exists=True))
+@click.argument("destination_path", type=click.Path(), required=False)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output.")
+def revert(
+    path: str,
+    destination_path: str,
+    verbose: bool,
+) -> None:
+    """
+    Revert a flashpack file back to a safetensors or torch file.
+    """
+    try:
+        result_path = revert_from_flashpack(
+            path,
+            destination_path,
             silent=not verbose,
         )
         print(green(f"Success: Saved to {os.path.abspath(result_path)}"))
