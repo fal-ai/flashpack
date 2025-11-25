@@ -7,9 +7,9 @@ def patch_diffusers_auto_model() -> None:
     """
     patch_diffusers_pipeline_loading_utils()
 
-    from flashpack.integrations.diffusers.auto_model import AutoFlashPackModel
-
     import diffusers.models.auto_model
+
+    from flashpack.integrations.diffusers.auto_model import AutoFlashPackModel
 
     diffusers.models.auto_model.AutoModel = AutoFlashPackModel
 

@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Optional
 
 import torch
 from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
@@ -13,7 +14,6 @@ from flashpack.integrations.transformers import FlashPackTransformersModelMixin
 from flashpack.utils import timer
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, UMT5EncoderModel
-from typing import Optional
 
 
 class FlashPackWanTransformer3DModel(

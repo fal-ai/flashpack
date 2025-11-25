@@ -1,9 +1,10 @@
 import os
 import time
 
+import matplotlib
 import safetensors.torch
 import torch
-import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,16 +17,18 @@ pt_filename = os.path.join(repo_dir, "pytorch_model.bin")
 sf_filename = os.path.join(repo_dir, "model.safetensors")
 flashpack_filename = os.path.join(repo_dir, "model.flashpack")
 
-print(f"Preparing model")
+print("Preparing model")
 model = GPT2Model.from_pretrained("gpt2", device_map="cuda")
 if not os.path.exists(flashpack_filename):
     pack_to_file(model, flashpack_filename, target_dtype=model.dtype)
 
 print("Running load time comparison (10 runs each)")
 
+
 def cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
 
 num_runs = 10
 times_pt = []
@@ -111,7 +114,9 @@ ax.set_yticks(y_pos)
 ax.set_yticklabels(labels, color=label_color)
 ax.invert_yaxis()  # top-to-bottom order as specified
 
-ax.set_xlabel("Loading Time (seconds)", fontsize=12, fontweight="bold", color=label_color)
+ax.set_xlabel(
+    "Loading Time (seconds)", fontsize=12, fontweight="bold", color=label_color
+)
 ax.set_title(
     "load_state_dict() Time Comparison",
     fontsize=14,

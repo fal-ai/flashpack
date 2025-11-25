@@ -14,15 +14,15 @@
 
 import os
 
-from flashpack.integrations.diffusers.model import FlashPackDiffusersModelMixin
-from flashpack.utils import logger
-from huggingface_hub.utils import validate_hf_hub_args
-
 from diffusers.configuration_utils import ConfigMixin
 from diffusers.utils.dynamic_modules_utils import (
     get_class_from_dynamic_module,
     resolve_trust_remote_code,
 )
+from huggingface_hub.utils import validate_hf_hub_args
+
+from flashpack.integrations.diffusers.model import FlashPackDiffusersModelMixin
+from flashpack.utils import logger
 
 
 class AutoFlashPackModel(ConfigMixin):

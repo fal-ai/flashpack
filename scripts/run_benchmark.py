@@ -8,13 +8,13 @@ import time
 import torch
 from flashpack.integrations.diffusers import patch_diffusers_auto_model
 from flashpack.integrations.transformers import patch_transformers_auto_model
+from huggingface_hub import snapshot_download
 
 patch_diffusers_auto_model()
 patch_transformers_auto_model()
 
-from diffusers.models import AutoModel as DiffusersAutoModel
-from huggingface_hub import snapshot_download
-from transformers import AutoModel as TransformersAutoModel
+from diffusers.models import AutoModel as DiffusersAutoModel  # noqa: E402
+from transformers import AutoModel as TransformersAutoModel  # noqa: E402
 
 
 def test_model(

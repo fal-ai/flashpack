@@ -7,10 +7,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from huggingface_hub import DDUFEntry, create_repo, read_dduf_file, snapshot_download
-from packaging import version
-from typing_extensions import Self
-
 from diffusers import OnnxRuntimeModel
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT, ModelMixin
 from diffusers.quantizers import PipelineQuantizationConfig
@@ -30,6 +26,9 @@ from diffusers.utils.hub_utils import (
     populate_model_card,
 )
 from diffusers.utils.torch_utils import get_device, is_compiled_module
+from huggingface_hub import DDUFEntry, create_repo, read_dduf_file, snapshot_download
+from packaging import version
+from typing_extensions import Self
 
 from ...constants import (
     DEFAULT_ALIGN_BYTES,
@@ -278,7 +277,6 @@ class FlashPackDiffusionPipeline(DiffusionPipeline):
         variant = kwargs.pop("variant", None)
         dduf_file = kwargs.pop("dduf_file", None)
         use_safetensors = kwargs.pop("use_safetensors", None)
-        use_onnx = kwargs.pop("use_onnx", None)
         load_connected_pipeline = kwargs.pop("load_connected_pipeline", False)
         quantization_config = kwargs.pop("quantization_config", None)
 

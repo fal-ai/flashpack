@@ -5,9 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from huggingface_hub import create_repo, snapshot_download
-
 import transformers
+from huggingface_hub import create_repo, snapshot_download
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils.hub import create_and_tag_model_card
 
@@ -119,7 +118,9 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         device = (
             torch.device(device)
             if isinstance(device, str)
-            else torch.device("cpu") if device is None else device
+            else torch.device("cpu")
+            if device is None
+            else device
         )
 
         user_agent = {

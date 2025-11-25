@@ -17,7 +17,6 @@ from .serialization import pack_to_file
 
 
 class FlashPackMixin:
-
     flashpack_coerce_dtype: bool = False
     flashpack_init_method: str | None = None
     flashpack_ignore_names: list[str] | None = None
@@ -53,7 +52,9 @@ class FlashPackMixin:
         device = (
             torch.device(device)
             if isinstance(device, str)
-            else torch.device("cpu") if device is None else device
+            else torch.device("cpu")
+            if device is None
+            else device
         )
 
         with init_empty_weights():
