@@ -37,24 +37,7 @@ def test_transformers() -> None:
     from flashpack.integrations.transformers.model import (
         FlashPackTransformersModelMixin,
     )
-    from transformers.models import AutoModel
-
-    model = AutoModel.from_pretrained(
-        "openai/clip-vit-base-patch32",
-    )
-    assert model is not None
-    assert isinstance(model, FlashPackTransformersModelMixin)
-
-    with TemporaryDirectory() as tmpdir:
-        model.save_pretrained_flashpack(tmpdir)
-        assert os.path.exists(os.path.join(tmpdir, "model.flashpack"))
-        assert AutoModel.from_pretrained_flashpack(tmpdir) is not None
-    patch_transformers_auto_model()
-
-    from flashpack.integrations.transformers.model import (
-        FlashPackTransformersModelMixin,
-    )
-    from transformers.models import AutoModel
+    from transformers.models.auto.modeling_auto import AutoModel
 
     model = AutoModel.from_pretrained(
         "openai/clip-vit-base-patch32",

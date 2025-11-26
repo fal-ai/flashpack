@@ -5,9 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from huggingface_hub import create_repo, snapshot_download
-
 import transformers
+from huggingface_hub import create_repo, snapshot_download
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils.hub import create_and_tag_model_card
 
@@ -55,7 +54,7 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
 
         self.save_flashpack(
             model_path,
-            target_dtype=target_dtype or self.dtype,
+            target_dtype=target_dtype,
             align_bytes=align_bytes,
             silent=silent,
             num_workers=num_workers,
@@ -119,7 +118,9 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         device = (
             torch.device(device)
             if isinstance(device, str)
-            else torch.device("cpu") if device is None else device
+            else torch.device("cpu")
+            if device is None
+            else device
         )
 
         user_agent = {
@@ -167,6 +168,7 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         )
 
         kwargs.update(model_kwargs)
+        kwargs.pop("config", None)
         return cls.from_flashpack(
             flashpack_path,
             config,

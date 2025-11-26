@@ -12,10 +12,11 @@ from .constants import (
     DEFAULT_ALIGN_BYTES,
     DEFAULT_NUM_WRITE_WORKERS,
     FILE_FORMAT_V3,
+    FILE_FORMAT_V4,
     MAGIC,
     U64LE,
 )
-from .utils import dtype_to_string, timer, torch_dtype_to_numpy_dtype
+from .utils import dtype_to_string, get_packing_dtype, timer, torch_dtype_to_numpy_dtype
 
 
 @dataclass
@@ -24,12 +25,23 @@ class TensorIndexRecord:
     shape: list[int]
     offset: int  # element offset (not bytes)
     length: int  # number of elements
+    macroblock: int = 0
+
+
+@dataclass
+class MacroblockPlan:
+    dtype: torch.dtype
+    offset_bytes: int
+    length_bytes: int
+    total_elems: int
+    align_elems: int
+    tensors: list[TensorIndexRecord]
 
 
 def pack_to_file(
     state_dict_or_model: dict[str, torch.Tensor] | torch.nn.Module,
     destination_path: str,
-    target_dtype: torch.dtype,
+    target_dtype: torch.dtype | None,
     name_order: list[str] | None = None,
     align_bytes: int = DEFAULT_ALIGN_BYTES,
     silent: bool = True,
@@ -57,33 +69,89 @@ def pack_to_file(
     if align_bytes < 0:
         raise ValueError("align_bytes must be >= 0")
 
-    element_size = torch.tensor([], dtype=target_dtype).element_size()
-    g = math.gcd(align_bytes, element_size) if align_bytes else 1
-    align_elems = (align_bytes // g) if align_bytes else 0
+    def _validate_dtype(dtype: torch.dtype) -> torch.dtype:
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unsupported dtype in state dict: {dtype}")
+        torch_dtype_to_numpy_dtype(dtype)
+        return dtype
+
+    def _lcm(a: int, b: int) -> int:
+        if a == 0 and b == 0:
+            return 0
+        if a == 0:
+            return abs(b)
+        if b == 0:
+            return abs(a)
+        return abs(a * b) // math.gcd(a, b)
+
+    resolved_target_dtype = (
+        _validate_dtype(target_dtype) if target_dtype is not None else None
+    )
+
+    dtype_to_names: dict[torch.dtype, list[str]] = {}
+    dtype_order: list[torch.dtype] = []
+    for name in names:
+        tensor = state_dict[name]
+        write_dtype = resolved_target_dtype or _validate_dtype(tensor.dtype)
+        if write_dtype not in dtype_to_names:
+            dtype_to_names[write_dtype] = []
+            dtype_order.append(write_dtype)
+        dtype_to_names[write_dtype].append(name)
 
     with timer("build_index", silent):
+        macroblocks: list[MacroblockPlan] = []
         index: list[TensorIndexRecord] = []
-        elem_cursor = 0
-        for name in names:
-            t = state_dict[name]
-            n = t.numel()
+        file_cursor = 0  # bytes
 
-            if align_elems:
-                pad_elems = (-elem_cursor) % align_elems
-                elem_cursor += pad_elems
+        for block_id, dtype in enumerate(dtype_order):
+            names_for_dtype = dtype_to_names[dtype]
+            elem_size = torch.tensor([], dtype=dtype).element_size()
+            block_alignment = _lcm(align_bytes, elem_size) if align_bytes else elem_size
+            if block_alignment:
+                pad_bytes = (-file_cursor) % block_alignment
+                file_cursor += pad_bytes
+            block_offset = file_cursor
 
-            index.append(
-                TensorIndexRecord(
-                    name=name, shape=list(t.shape), offset=elem_cursor, length=n
+            g = math.gcd(align_bytes, elem_size) if align_bytes else 1
+            align_elems = (align_bytes // g) if align_bytes else 0
+
+            block_cursor = 0
+            block_records: list[TensorIndexRecord] = []
+            for name in names_for_dtype:
+                tensor = state_dict[name]
+                n = tensor.numel()
+                if align_elems:
+                    pad_elems = (-block_cursor) % align_elems
+                    block_cursor += pad_elems
+
+                rec = TensorIndexRecord(
+                    name=name,
+                    shape=list(tensor.shape),
+                    offset=block_cursor,
+                    length=n,
+                    macroblock=block_id,
+                )
+                block_records.append(rec)
+                index.append(rec)
+                block_cursor += n
+
+            block_size_bytes = block_cursor * elem_size
+            macroblocks.append(
+                MacroblockPlan(
+                    dtype=dtype,
+                    offset_bytes=block_offset,
+                    length_bytes=block_size_bytes,
+                    total_elems=block_cursor,
+                    align_elems=align_elems,
+                    tensors=block_records,
                 )
             )
-            elem_cursor += n
+            file_cursor = block_offset + block_size_bytes
 
-    total_elems = elem_cursor
-    if total_elems == 0:
+    total_payload_bytes = file_cursor
+    if total_payload_bytes == 0:
         raise ValueError("Nothing to pack after alignment.")
 
-    np_dtype = torch_dtype_to_numpy_dtype(target_dtype)
     dest_dir = os.path.dirname(os.path.abspath(destination_path)) or "."
     os.makedirs(dest_dir, exist_ok=True)
     fd_tmp = None
@@ -95,12 +163,20 @@ def pack_to_file(
         os.close(fd_tmp)
 
         with timer("create_memmap", silent):
-            mm = np.memmap(tmp_path, dtype=np_dtype, mode="w+", shape=(total_elems,))
-            flash_view = (
-                torch.from_numpy(mm)
-                if target_dtype != torch.bfloat16
-                else torch.from_numpy(mm.view(np.uint16))
+            mm = np.memmap(
+                tmp_path, dtype=np.uint8, mode="w+", shape=(total_payload_bytes,)
             )
+
+            block_numpy_views: list[np.ndarray] = []
+            block_views: list[torch.Tensor] = []
+            for block in macroblocks:
+                block_slice = mm[
+                    block.offset_bytes : block.offset_bytes + block.length_bytes
+                ]
+                np_dtype = torch_dtype_to_numpy_dtype(block.dtype)
+                typed_view = block_slice.view(np_dtype)
+                block_numpy_views.append(typed_view)
+                block_views.append(torch.from_numpy(typed_view))
 
         # Optimized copy: sequential with batched progress updates
         with timer("copy_to_memmap", silent):
@@ -120,17 +196,22 @@ def pack_to_file(
                 actual_workers = min(4, num_workers)
 
                 def copy_one(rec: TensorIndexRecord) -> None:
+                    block = macroblocks[rec.macroblock]
+                    dst_block = block_views[rec.macroblock]
                     src = state_dict[rec.name]
-                    if target_dtype == torch.bfloat16:
+                    target_dtype = block.dtype
+                    packing_dtype = get_packing_dtype(target_dtype)
+
+                    if target_dtype != packing_dtype:
                         src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
-                        src_bits = src_cpu.view(torch.uint16)
-                        dst = flash_view.narrow(0, rec.offset, rec.length).view(
-                            torch.uint16
+                        src_bits = src_cpu.view(packing_dtype)
+                        dst = dst_block.narrow(0, rec.offset, rec.length).view(
+                            packing_dtype
                         )
                         dst.copy_(src_bits, non_blocking=False)
                     else:
                         src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
-                        dst = flash_view.narrow(0, rec.offset, rec.length)
+                        dst = dst_block.narrow(0, rec.offset, rec.length)
                         dst.copy_(src_cpu, non_blocking=False)
 
                 with ThreadPoolExecutor(max_workers=actual_workers) as ex:
@@ -153,18 +234,22 @@ def pack_to_file(
                 progress_update_interval = max(1, len(index) // 100)
 
                 for i, rec in enumerate(index):
+                    block = macroblocks[rec.macroblock]
+                    dst_block = block_views[rec.macroblock]
                     src = state_dict[rec.name]
+                    target_dtype = block.dtype
+                    packing_dtype = get_packing_dtype(target_dtype)
 
-                    if target_dtype == torch.bfloat16:
+                    if target_dtype != packing_dtype:
                         src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
-                        src_bits = src_cpu.view(torch.uint16)
-                        dst = flash_view.narrow(0, rec.offset, rec.length).view(
-                            torch.uint16
+                        src_bits = src_cpu.view(packing_dtype)
+                        dst = dst_block.narrow(0, rec.offset, rec.length).view(
+                            packing_dtype
                         )
                         dst.copy_(src_bits, non_blocking=False)
                     else:
                         src_cpu = src.view(-1).to(dtype=target_dtype, device="cpu")
-                        dst = flash_view.narrow(0, rec.offset, rec.length)
+                        dst = dst_block.narrow(0, rec.offset, rec.length)
                         dst.copy_(src_cpu, non_blocking=False)
 
                     # Batch progress updates to reduce overhead
@@ -184,21 +269,49 @@ def pack_to_file(
             mm.flush()
 
         # Append footer
-        meta_payload = {
-            "format": FILE_FORMAT_V3,
-            "target_dtype": dtype_to_string(target_dtype),
-            "align_bytes": int(align_bytes),
-            "total_elems": int(total_elems),
-            "index": [
-                {
-                    "name": r.name,
-                    "shape": r.shape,
-                    "offset": int(r.offset),
-                    "length": int(r.length),
-                }
-                for r in index
-            ],
-        }
+        if len(macroblocks) == 1:
+            block = macroblocks[0]
+            meta_payload = {
+                "format": FILE_FORMAT_V3,
+                "target_dtype": dtype_to_string(block.dtype),
+                "align_bytes": int(align_bytes),
+                "total_elems": int(block.total_elems),
+                "index": [
+                    {
+                        "name": r.name,
+                        "shape": r.shape,
+                        "offset": int(r.offset),
+                        "length": int(r.length),
+                    }
+                    for r in index
+                ],
+            }
+        else:
+            meta_payload = {
+                "format": FILE_FORMAT_V4,
+                "align_bytes": int(align_bytes),
+                "total_payload_bytes": int(total_payload_bytes),
+                "total_elems": sum(block.total_elems for block in macroblocks),
+                "macroblocks": [
+                    {
+                        "dtype": dtype_to_string(block.dtype),
+                        "offset_bytes": int(block.offset_bytes),
+                        "length_bytes": int(block.length_bytes),
+                        "length_elems": int(block.total_elems),
+                    }
+                    for block in macroblocks
+                ],
+                "index": [
+                    {
+                        "name": r.name,
+                        "shape": r.shape,
+                        "offset": int(r.offset),
+                        "length": int(r.length),
+                        "macroblock": int(r.macroblock),
+                    }
+                    for r in index
+                ],
+            }
         footer_json = json.dumps(
             meta_payload, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")

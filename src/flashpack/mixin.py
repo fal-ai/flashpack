@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any
+from collections.abc import Callable
+from typing import Any, ClassVar
 
 import torch
 from accelerate import init_empty_weights
@@ -17,12 +18,11 @@ from .serialization import pack_to_file
 
 
 class FlashPackMixin:
-
-    flashpack_coerce_dtype: bool = False
-    flashpack_init_method: str | None = None
-    flashpack_ignore_names: list[str] | None = None
-    flashpack_ignore_prefixes: list[str] | None = None
-    flashpack_ignore_suffixes: list[str] | None = None
+    flashpack_coerce_dtype: ClassVar[bool] = False
+    flashpack_init_method: ClassVar[str | None] = None
+    flashpack_ignore_names: ClassVar[list[str] | None] = None
+    flashpack_ignore_prefixes: ClassVar[list[str] | None] = None
+    flashpack_ignore_suffixes: ClassVar[list[str] | None] = None
 
     @classmethod
     def from_flashpack(
@@ -45,6 +45,7 @@ class FlashPackMixin:
         local_rank: int | None = None,
         world_size: int | None = None,
         coerce_dtype: bool = False,
+        init_fn: Callable[..., "FlashPackMixin"] | None = None,
         **kwargs: Any,
     ) -> FlashPackMixin:
         """
@@ -53,18 +54,22 @@ class FlashPackMixin:
         device = (
             torch.device(device)
             if isinstance(device, str)
-            else torch.device("cpu") if device is None else device
+            else torch.device("cpu")
+            if device is None
+            else device
         )
 
         with init_empty_weights():
-            if cls.flashpack_init_method is not None and hasattr(
-                cls, cls.flashpack_init_method
-            ):
-                init_fn = getattr(cls, cls.flashpack_init_method)
-            else:
-                init_fn = cls
+            if init_fn is None:
+                if cls.flashpack_init_method is not None and hasattr(
+                    cls, cls.flashpack_init_method
+                ):
+                    init_fn = getattr(cls, cls.flashpack_init_method)
+                else:
+                    init_fn = cls
 
             parameters = inspect.signature(init_fn).parameters
+            kwargs = {k: v for k, v in kwargs.items() if k in parameters}
             if "rank" in parameters:
                 kwargs["rank"] = rank
             if "local_rank" in parameters:
@@ -99,7 +104,7 @@ class FlashPackMixin:
     def save_flashpack(
         self,
         destination_path: str,
-        target_dtype: torch.dtype,
+        target_dtype: torch.dtype | None = None,
         name_order: list[str] | None = None,
         align_bytes: int = DEFAULT_ALIGN_BYTES,
         silent: bool = False,

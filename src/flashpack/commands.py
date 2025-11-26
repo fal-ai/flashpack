@@ -38,6 +38,7 @@ def convert_to_flashpack_from_state_dict(
     ignore_names: list[str] | None = None,
     ignore_prefixes: list[str] | None = None,
     ignore_suffixes: list[str] | None = None,
+    silent: bool = True,
 ) -> str:
     """
     Converts a state dictionary to a flashpack file.
@@ -54,13 +55,12 @@ def convert_to_flashpack_from_state_dict(
 
     if isinstance(dtype, str):
         dtype = string_to_dtype(dtype)
-    elif dtype is None:
-        dtype = next(iter(state_dict.values())).dtype
 
     pack_to_file(
         state_dict,
         destination_path,
         dtype,
+        silent=silent,
     )
 
     return destination_path
@@ -73,16 +73,11 @@ def convert_to_flashpack_from_model(
     ignore_names: list[str] | None = None,
     ignore_prefixes: list[str] | None = None,
     ignore_suffixes: list[str] | None = None,
+    silent: bool = True,
 ) -> str:
     """
     Converts a model to a flashpack file.
     """
-    if dtype is None:
-        try:
-            dtype = model.dtype
-        except AttributeError:
-            dtype = next(model.parameters()).dtype
-
     return convert_to_flashpack_from_state_dict(
         model.state_dict(),
         destination_path,
@@ -90,6 +85,7 @@ def convert_to_flashpack_from_model(
         ignore_names,
         ignore_prefixes,
         ignore_suffixes,
+        silent,
     )
 
 
@@ -100,6 +96,7 @@ def convert_to_flashpack_from_state_dict_file(
     ignore_names: list[str] | None = None,
     ignore_prefixes: list[str] | None = None,
     ignore_suffixes: list[str] | None = None,
+    silent: bool = True,
 ) -> str:
     """
     Converts a state dictionary file to a flashpack file.
@@ -121,6 +118,7 @@ def convert_to_flashpack_from_state_dict_file(
         ignore_names,
         ignore_prefixes,
         ignore_suffixes,
+        silent,
     )
 
 
@@ -131,12 +129,14 @@ def convert_to_flashpack_from_diffusers_repo_id_or_dir(
     ignore_names: list[str] | None = None,
     ignore_prefixes: list[str] | None = None,
     ignore_suffixes: list[str] | None = None,
+    silent: bool = True,
     **kwargs: Any,
 ) -> str:
     """
     Converts a diffusers model to a flashpack model.
     """
     from diffusers import AutoModel
+
     from .utils import string_to_dtype
 
     if isinstance(dtype, str):
@@ -151,6 +151,7 @@ def convert_to_flashpack_from_diffusers_repo_id_or_dir(
         ignore_names=ignore_names,
         ignore_prefixes=ignore_prefixes,
         ignore_suffixes=ignore_suffixes,
+        silent=silent,
     )
     return destination_path
 
@@ -162,12 +163,14 @@ def convert_to_flashpack_from_transformers_repo_id_or_dir(
     ignore_names: list[str] | None = None,
     ignore_prefixes: list[str] | None = None,
     ignore_suffixes: list[str] | None = None,
+    silent: bool = True,
     **kwargs: Any,
 ) -> str:
     """
     Converts a transformers model to a flashpack model.
     """
     from transformers import AutoModel
+
     from .utils import string_to_dtype
 
     if isinstance(dtype, str):
@@ -182,6 +185,7 @@ def convert_to_flashpack_from_transformers_repo_id_or_dir(
         ignore_names=ignore_names,
         ignore_prefixes=ignore_prefixes,
         ignore_suffixes=ignore_suffixes,
+        silent=silent,
     )
     return destination_path
 
@@ -197,6 +201,7 @@ def convert_to_flashpack(
     ignore_suffixes: list[str] | None = None,
     use_transformers: bool = False,
     use_diffusers: bool = False,
+    silent: bool = True,
     **kwargs: Any,
 ) -> str:
     """
@@ -215,6 +220,7 @@ def convert_to_flashpack(
             ignore_names,
             ignore_prefixes,
             ignore_suffixes,
+            silent,
         )
 
     model_dir = model_or_state_dict_or_path_or_repo_id
@@ -266,6 +272,7 @@ def convert_to_flashpack(
             ignore_names,
             ignore_prefixes,
             ignore_suffixes,
+            silent,
             **kwargs,
         )
     return convert_to_flashpack_from_diffusers_repo_id_or_dir(
@@ -275,5 +282,33 @@ def convert_to_flashpack(
         ignore_names,
         ignore_prefixes,
         ignore_suffixes,
+        silent,
         **kwargs,
     )
+
+
+def revert_from_flashpack(
+    path: str,
+    destination_path: str | None = None,
+    silent: bool = True,
+) -> str:
+    """
+    Reverts a flashpack file to a state dictionary.
+    """
+    from .deserialization import revert_from_file
+
+    state_dict = revert_from_file(path, silent=silent)
+    if not destination_path:
+        destination_path = path.replace(".flashpack", ".safetensors")
+
+    _, ext = os.path.splitext(destination_path)
+    if ext == ".safetensors":
+        from safetensors.torch import save_file
+
+        save_file(state_dict, destination_path)
+    else:
+        import torch
+
+        torch.save(state_dict, destination_path)
+
+    return destination_path

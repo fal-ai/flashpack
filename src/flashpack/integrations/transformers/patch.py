@@ -29,9 +29,6 @@ def patch_auto_factory() -> None:
         from transformers.configuration_utils import (
             PretrainedConfig as PreTrainedConfig,
         )
-    from flashpack.integrations.transformers.model import (
-        FlashPackTransformersModelMixin,
-    )
 
     import transformers.models.auto.auto_factory
     from transformers.dynamic_module_utils import (
@@ -39,6 +36,10 @@ def patch_auto_factory() -> None:
         resolve_trust_remote_code,
     )
     from transformers.models.auto.configuration_auto import AutoConfig
+
+    from flashpack.integrations.transformers.model import (
+        FlashPackTransformersModelMixin,
+    )
 
     def patched_from_config(cls, config, **kwargs):
         trust_remote_code = kwargs.pop("trust_remote_code", None)
@@ -316,6 +317,4 @@ def patch_auto_factory() -> None:
     transformers.models.auto.auto_factory._BaseAutoModelClass.from_pretrained = (
         patched_from_pretrained
     )
-    transformers.models.auto.auto_factory._BaseAutoModelClass.from_pretrained_flashpack = (
-        from_pretrained_flashpack
-    )
+    transformers.models.auto.auto_factory._BaseAutoModelClass.from_pretrained_flashpack = from_pretrained_flashpack

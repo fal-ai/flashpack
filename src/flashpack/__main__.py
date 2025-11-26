@@ -1,10 +1,12 @@
 import json as jsonlib
 import os
+import traceback
 
 import click
 
 from . import __version__
-from .commands import convert_to_flashpack
+from .commands import convert_to_flashpack, revert_from_flashpack
+from .constants import FILE_FORMAT_V3, FILE_FORMAT_V4
 from .deserialization import get_flashpack_file_metadata
 from .integrations import patch_integrations
 
@@ -31,6 +33,10 @@ def magenta(text: str) -> str:
     return click.style(text, fg="magenta")
 
 
+def cyan(text: str) -> str:
+    return click.style(text, fg="cyan")
+
+
 @click.group(name="flashpack")
 @click.version_option(__version__)
 def main() -> None:
@@ -54,16 +60,54 @@ def metadata(path: str, show_index: bool, json: bool) -> None:
     if json:
         print(jsonlib.dumps(metadata, indent=2))
     else:
+        macroblocks = None
+        format = metadata.get("format")
+
+        if format == FILE_FORMAT_V4:
+            num_digits = len(str(metadata.get("total_payload_bytes", 0)))
+        elif format == FILE_FORMAT_V3:
+            num_digits = len(str(metadata.get("total_elems", 0)))
+        else:
+            num_digits = 10  # default to 10 digits for unknown format
+
         for k, v in metadata.items():
             if k == "index":
                 continue
-            print(f"{green(k)}: {v}")
+            elif k == "macroblocks":
+                macroblocks = v
+                macroblocks.sort(key=lambda x: x["offset_bytes"])
+                print(f"{green('macroblocks')}:")
+                for i, r in enumerate(macroblocks):
+                    start_bytes = r["offset_bytes"]
+                    end_bytes = start_bytes + r["length_bytes"]
+                    print(
+                        f"  {magenta(i)}: {r['dtype'].ljust(10)} {start_bytes:0{num_digits}d}:{end_bytes:0{num_digits}d}"
+                    )
+            else:
+                print(f"{green(k)}: {v}")
+
         if "index" in metadata and show_index:
             print(f"{green('index')}:")
             num_index_digits = len(str(len(metadata["index"])))
-            for i, r in enumerate(metadata["index"]):
+            index_items = metadata["index"]
+            index_items.sort(key=lambda x: (x.get("macroblock", 0), x["offset"]))
+            last_seen_macroblock = None
+
+            for i, r in enumerate(index_items):
+                macroblock = r.get("macroblock", 0)
+                if last_seen_macroblock != macroblock:
+                    if macroblocks:
+                        macroblock_dtype = macroblocks[macroblock]["dtype"]
+                    else:
+                        macroblock_dtype = metadata["target_dtype"]
+                    if format == FILE_FORMAT_V4:
+                        print(
+                            f"  {cyan('macroblock' + str(macroblock))}: {macroblock_dtype.ljust(10)} {r['offset']:0{num_digits}d}:{r['offset'] + r['length']:0{num_digits}d}"
+                        )
+
+                    last_seen_macroblock = macroblock
+
                 offset_end = r["offset"] + r["length"]
-                num_digits = len(str(metadata["total_elems"]))
                 element_range = (
                     f"{r['offset']:0{num_digits}d}:{offset_end:0{num_digits}d}"
                 )
@@ -111,6 +155,7 @@ def metadata(path: str, show_index: bool, json: bool) -> None:
 @click.option(
     "--use-diffusers", is_flag=True, help="Use diffusers to convert the model."
 )
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output.")
 def convert(
     path_or_repo_id: str,
     destination_path: str,
@@ -122,6 +167,7 @@ def convert(
     ignore_suffixes: list[str],
     use_transformers: bool,
     use_diffusers: bool,
+    verbose: bool,
 ) -> None:
     """
     Convert a model to a flashpack file.
@@ -138,10 +184,39 @@ def convert(
             use_diffusers=use_diffusers,
             subfolder=subfolder,
             variant=variant,
+            silent=not verbose,
         )
         print(green(f"Success: Saved to {os.path.abspath(result_path)}"))
     except Exception as e:
         print(red(f"Error: {e}"))
+        if verbose:
+            traceback.print_exc()
+        exit(1)
+
+
+@main.command(name="revert")
+@click.argument("path", type=click.Path(exists=True))
+@click.argument("destination_path", type=click.Path(), required=False)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output.")
+def revert(
+    path: str,
+    destination_path: str,
+    verbose: bool,
+) -> None:
+    """
+    Revert a flashpack file back to a safetensors or torch file.
+    """
+    try:
+        result_path = revert_from_flashpack(
+            path,
+            destination_path,
+            silent=not verbose,
+        )
+        print(green(f"Success: Saved to {os.path.abspath(result_path)}"))
+    except Exception as e:
+        print(red(f"Error: {e}"))
+        if verbose:
+            traceback.print_exc()
         exit(1)
 
 
