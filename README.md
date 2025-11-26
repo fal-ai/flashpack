@@ -7,10 +7,6 @@
 <h2>Disk-to-GPU Tensor loading at up to 25Gbps without GDS</h2>
 </div>
 
-## Updates
-
-- **2025-11-25**: Now supports **multiple data types per checkpoint** with no regressions in speed!
-
 <div align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/fal-ai/flashpack/blob/main/media/benchmark-white.png?raw=true">
@@ -28,6 +24,11 @@
 </picture>
 <em>Run this benchmark in `tests/test_speed_comparison.py`</em>
 </div>
+
+## Updates
+
+- **2025-11-25**: Now supports **multiple data types per checkpoint** with no regressions in speed!
+
 
 # Integration Guide
 ## Mixins
