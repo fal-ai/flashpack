@@ -37,7 +37,7 @@ def test_transformers() -> None:
     from flashpack.integrations.transformers.model import (
         FlashPackTransformersModelMixin,
     )
-    from transformers.models import AutoModel
+    from transformers.models.auto.modeling_auto import AutoModel
 
     model = AutoModel.from_pretrained(
         "openai/clip-vit-base-patch32",

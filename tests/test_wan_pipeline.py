@@ -116,8 +116,6 @@ def test_save_pipeline(saved_pipeline):
 
 def test_load_and_inference_accelerate(repo_dir):
     """Test loading and running inference with accelerate."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
     with timer("load_and_inference_accelerate"):
         pipeline = FlashPackWanPipeline.from_pretrained(
             repo_dir,
