@@ -168,6 +168,7 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         )
 
         kwargs.update(model_kwargs)
+        kwargs.pop("config", None)
         return cls.from_flashpack(
             flashpack_path,
             config,
