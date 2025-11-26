@@ -12,6 +12,7 @@ from flashpack import assign_from_file, pack_to_file
 from huggingface_hub import snapshot_download
 from transformers import GPT2Model
 
+
 def test_speed_comparison() -> None:
     """
     Test the speed comparison between PyTorch, Safetensors, and Flashpack.
@@ -27,7 +28,6 @@ def test_speed_comparison() -> None:
         pack_to_file(model, flashpack_filename, target_dtype=model.dtype)
 
     print("Running load time comparison (10 runs each)")
-
 
     def cuda_sync():
         if torch.cuda.is_available():
