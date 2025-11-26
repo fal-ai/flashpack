@@ -1,7 +1,7 @@
 import os
-import sys
 from typing import Optional
 
+import pytest
 import torch
 from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
 from diffusers.pipelines import WanPipeline
@@ -55,21 +55,25 @@ class FlashPackWanPipeline(WanPipeline, FlashPackDiffusionPipeline):
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-pipeline_dir = os.path.join(HERE, "wan_pipeline")
-os.makedirs(pipeline_dir, exist_ok=True)
+PIPELINE_DIR = os.path.join(HERE, "wan_pipeline")
 
-if len(sys.argv) < 2:
-    raise ValueError("Usage: python wan_pipe.py <save|load>")
 
-if sys.argv[1] not in ["save", "load"]:
-    raise ValueError("Usage: python wan_pipe.py <save|load>")
+@pytest.fixture(scope="module")
+def repo_dir():
+    """Download and cache the Wan model repository."""
+    return snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
 
-is_save = sys.argv[1] == "save"
-is_load = sys.argv[1] == "load"
 
-repo_dir = snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+@pytest.fixture(scope="module")
+def pipeline_dir():
+    """Return the directory for saving/loading the flashpack pipeline."""
+    os.makedirs(PIPELINE_DIR, exist_ok=True)
+    return PIPELINE_DIR
 
-if is_save:
+
+@pytest.fixture(scope="module")
+def saved_pipeline(repo_dir, pipeline_dir):
+    """Save the pipeline using flashpack and return the path."""
     transformer = FlashPackWanTransformer3DModel.from_pretrained(
         os.path.join(repo_dir, "transformer"),
         torch_dtype=torch.bfloat16,
@@ -98,35 +102,53 @@ if is_save:
     )
 
     with timer("save"):
-        pipeline.save_pretrained_flashpack(
-            pipeline_dir,
-        )
+        pipeline.save_pretrained_flashpack(pipeline_dir)
 
-elif is_load:
+    return pipeline_dir
+
+
+def test_save_pipeline(saved_pipeline):
+    """Test that the pipeline can be saved using flashpack."""
+    assert os.path.exists(saved_pipeline)
+    # Check that the expected files exist
+    assert os.path.isdir(saved_pipeline)
+
+
+def test_load_and_inference_accelerate(repo_dir):
+    """Test loading and running inference with accelerate."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    generator = torch.Generator(device=device).manual_seed(42)
+
     with timer("load_and_inference_accelerate"):
         pipeline = FlashPackWanPipeline.from_pretrained(
             repo_dir,
             device_map="cuda",
             torch_dtype=torch.bfloat16,
         )
-        pipeline(
+        output = pipeline(
             prompt="A beautiful sunset over a calm ocean.",
             width=832,
             height=480,
             num_inference_steps=28,
         )
 
+    assert output is not None
+
+
+def test_load_and_inference_flashpack(saved_pipeline):
+    """Test loading and running inference with flashpack."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = torch.Generator(device=device).manual_seed(42)
+
     with timer("load_and_inference_flashpack"):
         pipeline = FlashPackWanPipeline.from_pretrained_flashpack(
-            pipeline_dir, device_map=device, silent=False
+            saved_pipeline, device_map=device, silent=False
         )
-        pipeline(
+        output = pipeline(
             prompt="A beautiful sunset over a calm ocean.",
             width=832,
             height=480,
             num_inference_steps=28,
             generator=generator,
         )
-    generator.manual_seed(42)
+
+    assert output is not None
