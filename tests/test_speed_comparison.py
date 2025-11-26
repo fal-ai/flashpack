@@ -83,7 +83,7 @@ def test_speed_comparison() -> None:
     # Plot configuration (aligned with scripts/plot-benchmark.py)
     accelerate_color = "#0f5ef3"
     flashpack_color = "#adff02"
-    label_color = "#111111"
+    label_color = "#eeeeee"
 
     labels = [
         "pytorch",
