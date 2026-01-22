@@ -90,7 +90,7 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         strict: bool | None = None,
         strict_params: bool = True,
         strict_buffers: bool = False,
-        keep_flash_ref_on_model: bool = True,
+        keep_flash_ref_on_model: bool = False,
         num_streams: int = DEFAULT_NUM_STREAMS,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
         ignore_names: list[str] | None = None,
