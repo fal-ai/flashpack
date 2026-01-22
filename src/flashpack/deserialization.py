@@ -209,12 +209,8 @@ def _copy_memmaps_into_storage(
 
         block_tensor = storage.block(idx)
         num_pipeline_buffers = max(1, min(num_streams, 8))
-
-        # For dtypes that require bit-reinterpretation (e.g. bfloat16 stored as uint16),
-        # allocate staging buffers in the packing dtype
-        packing_dtype = get_packing_dtype(spec.dtype)
         staging_bufs = [
-            torch.empty(elems_per_chunk, dtype=packing_dtype, pin_memory=True)
+            torch.empty(elems_per_chunk, dtype=spec.dtype, pin_memory=True)
             for _ in range(num_pipeline_buffers)
         ]
         num_cuda_streams = max(1, min(num_streams, 8))
@@ -226,7 +222,7 @@ def _copy_memmaps_into_storage(
             sz = end - start
 
             buf_idx = chunk_idx % num_pipeline_buffers
-            buf_raw = staging_bufs[buf_idx].narrow(0, 0, sz)
+            buf = staging_bufs[buf_idx].narrow(0, 0, sz)
             stream = streams[chunk_idx % num_cuda_streams]
 
             if chunk_idx >= num_pipeline_buffers:
@@ -236,13 +232,9 @@ def _copy_memmaps_into_storage(
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
                 src_t = torch.from_numpy(np_view)
-            buf_raw.copy_(src_t, non_blocking=False)
-
-            # Reinterpret bits if needed (e.g. uint16 -> bfloat16)
-            if spec.dtype != packing_dtype:
-                buf = buf_raw.view(spec.dtype)
-            else:
-                buf = buf_raw
+            if src_t.dtype != spec.dtype:
+                src_t = src_t.to(dtype=spec.dtype)
+            buf.copy_(src_t, non_blocking=False)
 
             with torch.cuda.stream(stream):
                 block_tensor.narrow(0, start, sz).copy_(buf, non_blocking=True)

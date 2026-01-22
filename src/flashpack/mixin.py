@@ -34,7 +34,7 @@ class FlashPackMixin:
         strict: bool | None = None,
         strict_params: bool = True,
         strict_buffers: bool = False,
-        keep_flash_ref_on_model: bool = True,
+        keep_flash_ref_on_model: bool = False,
         ignore_names: list[str] | None = None,
         ignore_prefixes: list[str] | None = None,
         ignore_suffixes: list[str] | None = None,
