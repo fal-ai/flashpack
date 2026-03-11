@@ -771,7 +771,6 @@ def load_sub_model_flashpack(
     """
     from diffusers.quantizers import PipelineQuantizationConfig
 
-    print(f"Loading {class_name} from {library_name}")
     is_auto_class = class_name.startswith("FlashPackAutoClass")
     if is_auto_class:
         class_name = class_name[len("FlashPackAutoClass") :]
