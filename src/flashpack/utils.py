@@ -16,6 +16,25 @@ try:
 except AttributeError:
     float4_e2m1fn = None  # type: ignore
 
+# fp8 dtypes were introduced across several torch releases (e.g.
+# ``float8_e8m0fnu`` only exists on torch >= 2.7). Resolve them by name so the
+# packing helpers keep importing and running on older torch builds, matching the
+# ``torch>=2.0`` support claimed in the project metadata. Referencing the
+# attributes unconditionally raises ``AttributeError`` on every call on torch
+# builds that lack them (e.g. torch 2.6).
+_FP8_DTYPE_NAMES = (
+    "float8_e4m3fn",
+    "float8_e4m3fnuz",
+    "float8_e5m2",
+    "float8_e5m2fnuz",
+    "float8_e8m0fnu",
+)
+_FP8_DTYPES: tuple[torch.dtype, ...] = tuple(
+    d
+    for d in (getattr(torch, name, None) for name in _FP8_DTYPE_NAMES)
+    if d is not None
+)
+
 
 def maybe_init_distributed(
     rank: int | None = None,
@@ -81,13 +100,7 @@ def get_packing_dtype(dtype: torch.dtype) -> torch.dtype:
     """
     if dtype is float4_e2m1fn:
         raise ValueError(f"Unsupported dtype for packing: {dtype}")
-    elif dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-        torch.float8_e8m0fnu,
-    ]:
+    elif dtype in _FP8_DTYPES:
         return torch.uint8
     elif dtype is torch.bfloat16:
         return torch.uint16
@@ -125,14 +138,13 @@ def torch_dtype_to_numpy_dtype(dtype: torch.dtype) -> np.dtype:
         torch.complex64: np.complex64,
         torch.complex128: np.complex128,
         # unsupported dtypes, we map to uints
-        torch.float8_e4m3fn: np.uint8,
-        torch.float8_e4m3fnuz: np.uint8,
-        torch.float8_e5m2: np.uint8,
-        torch.float8_e5m2fnuz: np.uint8,
-        torch.float8_e8m0fnu: np.uint8,
         torch.bfloat16: np.uint16,
         torch.complex32: np.uint32,
     }
+    # fp8 dtypes have no numpy analogue; store their raw bytes as uint8. Only the
+    # ones present in this torch build are registered (see ``_FP8_DTYPES``).
+    for fp8_dtype in _FP8_DTYPES:
+        mapping[fp8_dtype] = np.uint8
     if dtype not in mapping:
         raise ValueError(f"Unsupported dtype for packing: {dtype}")
     return mapping[dtype]
