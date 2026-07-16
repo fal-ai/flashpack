@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import itertools
+import warnings
 from collections.abc import Callable
 from typing import Any, ClassVar
 
@@ -59,7 +61,17 @@ class FlashPackMixin:
             else device
         )
 
-        with init_empty_weights():
+        # ``include_buffers=False`` keeps parameters on the meta device (the
+        # memory win) while letting the module's ``__init__`` materialize its
+        # buffers with their real, computed values. Packs only contain
+        # ``state_dict()`` (i.e. persistent buffers), so non-persistent buffers
+        # such as CLIP ``position_ids`` or rotary ``inv_freq`` are never written
+        # to the pack; if they were placed on the meta device here they would
+        # stay meta after loading and later crash ("Cannot copy out of meta
+        # tensor") or silently corrupt outputs. Passing this explicitly also
+        # overrides the ``ACCELERATE_INIT_INCLUDE_BUFFERS`` environment variable,
+        # which otherwise flips accelerate's default to put buffers on meta.
+        with init_empty_weights(include_buffers=False):
             if init_fn is None:
                 if cls.flashpack_init_method is not None and hasattr(
                     cls, cls.flashpack_init_method
@@ -99,6 +111,37 @@ class FlashPackMixin:
             world_size=world_size,
             coerce_dtype=coerce_dtype or cls.flashpack_coerce_dtype,
         )
+
+        if isinstance(model, torch.nn.Module):
+            # Match diffusers' ``ModelMixin.from_pretrained`` and transformers'
+            # ``PreTrainedModel.from_pretrained``, which both return the model in
+            # evaluation mode. Without this, dropout/other train-only layers
+            # stay active (e.g. T5's dropout ``p=0.1``), producing
+            # nondeterministic, corrupted inference outputs. Callers that want
+            # to fine-tune can re-enable training with ``model.train()``.
+            model.eval()
+
+            # ``init_empty_weights`` allocates parameters on the meta device.
+            # Anything left unmaterialized after loading (a tensor missing from
+            # the pack while a non-strict flag is set) stays on meta and will
+            # crash or silently corrupt outputs when used. Surface it loudly
+            # rather than failing deep inside a forward pass later.
+            leftover_meta = [
+                name
+                for name, tensor in itertools.chain(
+                    model.named_parameters(), model.named_buffers()
+                )
+                if tensor.is_meta
+            ]
+            if leftover_meta:
+                warnings.warn(
+                    f"flashpack: {len(leftover_meta)} tensor(s) remain on the "
+                    f"meta device after loading from {path!r} and were not "
+                    f"materialized: {leftover_meta}. Using the model will crash "
+                    "or produce incorrect results.",
+                    stacklevel=2,
+                )
+
         return model
 
     def save_flashpack(
