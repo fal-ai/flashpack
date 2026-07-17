@@ -19,6 +19,10 @@ from .constants import (
     MAGIC,
     U64LE,
 )
+from .parallel_read import (
+    parallel_read_into_storage,
+    parallel_read_supported,
+)
 from .utils import (
     get_module_and_attribute,
     get_packing_dtype,
@@ -283,10 +287,9 @@ def read_flashpack_file(
     specs = _build_macroblock_specs(meta)
     device = torch.device(device) if isinstance(device, str) else device
 
-    with timer("mmap_payload", silent):
-        memmaps = _open_memmaps(path, specs)
-
     if device.type == "cpu":
+        with timer("mmap_payload", silent):
+            memmaps = _open_memmaps(path, specs)
         with timer("cpu_from_memmap", silent):
             storage = _cpu_storage_from_memmaps(memmaps, specs)
         return storage, meta
@@ -296,6 +299,14 @@ def read_flashpack_file(
 
     with timer("alloc_device", silent):
         storage = _allocate_empty_storage(specs, device)
+
+    if parallel_read_supported(device):
+        with timer("read_and_copy", silent):
+            parallel_read_into_storage(path, specs, storage.blocks, device)
+        return storage, meta
+
+    with timer("mmap_payload", silent):
+        memmaps = _open_memmaps(path, specs)
 
     with timer("read_and_copy", silent):
         _copy_memmaps_into_storage(
