@@ -6,7 +6,6 @@ import os
 
 import pytest
 import torch
-
 from flashpack.deserialization import MacroblockSpec
 from flashpack.parallel_read import (
     _ALIGN,

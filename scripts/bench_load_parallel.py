@@ -27,7 +27,6 @@ import sys
 import time
 
 import torch
-
 from flashpack.deserialization import read_flashpack_file
 from flashpack.serialization import pack_to_file
 

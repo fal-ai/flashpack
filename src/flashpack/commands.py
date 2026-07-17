@@ -229,9 +229,9 @@ def convert_to_flashpack(
         if destination_path is None:
             destination_path = os.path.join(model_dir, "model.flashpack")
     else:
-        assert (
-            destination_path is not None
-        ), "destination_path is required when model_or_state_dict_or_path_or_repo_id is repo_id"
+        assert destination_path is not None, (
+            "destination_path is required when model_or_state_dict_or_path_or_repo_id is repo_id"
+        )
         os.makedirs(destination_path, exist_ok=True)
 
         if not use_transformers and not use_diffusers:
