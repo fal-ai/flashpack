@@ -175,6 +175,32 @@ def _read_chunk(fd_direct, fd_plain: int, view, f_off: int, ln: int) -> None:
         got += n
 
 
+def _plan_chunks(
+    specs: "list[MacroblockSpec]", chunk_bytes: int
+) -> list[tuple[int, int, int, int]]:
+    """(block_idx, file_offset, block_offset, length) chunks covering every
+    macroblock. Every chunk after a macroblock's (sub-page) head starts
+    4K-aligned in file space and at position 0 of its staging buffer —
+    satisfying both O_DIRECT alignment requirements.
+    """
+    chunks: list[tuple[int, int, int, int]] = []
+    for idx, spec in enumerate(specs):
+        b_off = 0
+        remaining = spec.length_bytes
+        head = (-spec.offset_bytes) % _ALIGN
+        if head:
+            head = min(head, remaining)
+            chunks.append((idx, spec.offset_bytes, 0, head))
+            b_off += head
+            remaining -= head
+        while remaining > 0:
+            ln = min(chunk_bytes, remaining)
+            chunks.append((idx, spec.offset_bytes + b_off, b_off, ln))
+            b_off += ln
+            remaining -= ln
+    return chunks
+
+
 def parallel_read_into_storage(
     path: str,
     specs: "list[MacroblockSpec]",
@@ -192,27 +218,19 @@ def parallel_read_into_storage(
 
     byte_views = [b.view(torch.uint8) for b in blocks]
 
-    # Plan chunks so every chunk after a macroblock's (sub-page) head starts
-    # 4K-aligned in file space and at position 0 of its staging buffer —
-    # satisfying both O_DIRECT alignment requirements.
+    # The destination blocks were allocated on the caller's current stream;
+    # order every reader stream after that allocation so the caching
+    # allocator cannot hand the readers memory whose prior (default-stream)
+    # work is still pending — the documented wait_event pattern. Free: one
+    # event, recorded once.
+    alloc_ready = torch.cuda.Event()
+    alloc_ready.record(torch.cuda.current_stream(device))
+
     work: queue.SimpleQueue = queue.SimpleQueue()
-    n_chunks = 0
-    for idx, spec in enumerate(specs):
-        b_off = 0
-        remaining = spec.length_bytes
-        head = (-spec.offset_bytes) % _ALIGN
-        if head:
-            head = min(head, remaining)
-            work.put((idx, spec.offset_bytes, 0, head))
-            n_chunks += 1
-            b_off += head
-            remaining -= head
-        while remaining > 0:
-            ln = min(chunk_bytes, remaining)
-            work.put((idx, spec.offset_bytes + b_off, b_off, ln))
-            n_chunks += 1
-            b_off += ln
-            remaining -= ln
+    chunks = _plan_chunks(specs, chunk_bytes)
+    for chunk in chunks:
+        work.put(chunk)
+    n_chunks = len(chunks)
 
     n_threads = min(n_threads, max(1, n_chunks))
     for _ in range(n_threads):
@@ -240,6 +258,7 @@ def parallel_read_into_storage(
                 except OSError:
                     fd_direct = None
             stream = torch.cuda.Stream(device=device)
+            stream.wait_event(alloc_ready)
             bufs = pool[thread_idx]
             # O_DIRECT also requires 4K-aligned user buffers; pinned
             # allocations are page-aligned in practice, but verify.
