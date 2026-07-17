@@ -1,57 +1,15 @@
 import os
-from typing import Optional
 
 import pytest
 import torch
-from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
 from diffusers.pipelines import WanPipeline
-from diffusers.schedulers import UniPCMultistepScheduler
-from flashpack.integrations.diffusers import (
-    FlashPackDiffusersModelMixin,
-    FlashPackDiffusionPipeline,
-)
-from flashpack.integrations.transformers import FlashPackTransformersModelMixin
+from flashpack.integrations.diffusers import FlashPackDiffusionPipeline
 from flashpack.utils import timer
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer, UMT5EncoderModel
-
-
-class FlashPackWanTransformer3DModel(
-    WanTransformer3DModel, FlashPackDiffusersModelMixin
-):
-    flashpack_ignore_prefixes = ["rope"]
-
-
-class FlashPackAutoencoderKLWan(AutoencoderKLWan, FlashPackDiffusersModelMixin):
-    pass
-
-
-class FlashPackUMT5EncoderModel(UMT5EncoderModel, FlashPackTransformersModelMixin):
-    flashpack_ignore_names = ["encoder.embed_tokens.weight"]
 
 
 class FlashPackWanPipeline(WanPipeline, FlashPackDiffusionPipeline):
-    def __init__(
-        self,
-        tokenizer: AutoTokenizer,
-        text_encoder: FlashPackUMT5EncoderModel,
-        vae: FlashPackAutoencoderKLWan,
-        scheduler: UniPCMultistepScheduler,
-        transformer: Optional[FlashPackWanTransformer3DModel] = None,
-        transformer_2: Optional[FlashPackWanTransformer3DModel] = None,
-        boundary_ratio: float | None = None,
-        expand_timesteps: bool = False,
-    ):
-        super().__init__(
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            vae=vae,
-            transformer=transformer,
-            transformer_2=transformer_2,
-            scheduler=scheduler,
-            boundary_ratio=boundary_ratio,
-            expand_timesteps=expand_timesteps,
-        )
+    pass
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,31 +32,10 @@ def pipeline_dir():
 @pytest.fixture(scope="module")
 def saved_pipeline(repo_dir, pipeline_dir):
     """Save the pipeline using flashpack and return the path."""
-    transformer = FlashPackWanTransformer3DModel.from_pretrained(
-        os.path.join(repo_dir, "transformer"),
-        torch_dtype=torch.bfloat16,
-    ).to(dtype=torch.bfloat16)
-    vae = FlashPackAutoencoderKLWan.from_pretrained(
-        os.path.join(repo_dir, "vae"),
-        torch_dtype=torch.float32,
-    ).to(dtype=torch.float32)
-    text_encoder = FlashPackUMT5EncoderModel.from_pretrained(
-        os.path.join(repo_dir, "text_encoder"),
-        torch_dtype=torch.bfloat16,
-    ).to(dtype=torch.bfloat16)
-    scheduler = UniPCMultistepScheduler.from_pretrained(
-        os.path.join(repo_dir, "scheduler"),
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.path.join(repo_dir, "tokenizer"),
-    )
-
-    pipeline = FlashPackWanPipeline(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        vae=vae,
-        transformer=transformer,
-        scheduler=scheduler,
+    pipeline = FlashPackWanPipeline.from_pretrained_flashpack(
+        repo_dir,
+        convert_diffusers_models=True,
+        convert_transformers_models=True,
     )
 
     with timer("save"):
