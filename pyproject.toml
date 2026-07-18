@@ -47,3 +47,10 @@ dev = [
 
 [tool.setuptools_scm]
 write_to = "src/flashpack/version.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device (skipped automatically when unavailable)",
+    "network: downloads model weights from the Hugging Face Hub",
+]

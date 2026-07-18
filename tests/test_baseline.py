@@ -2,6 +2,7 @@ import gc
 import os
 import tempfile
 
+import pytest
 import torch
 import tqdm
 from flashpack import FlashPackMixin
@@ -108,6 +109,7 @@ def test_load_unload() -> None:
         assert torch.allclose(model2.blocks[0].weight, model.blocks[0].weight)
 
 
+@pytest.mark.network
 def test_wan_transformer() -> None:
     """
     Tests a WanTransformer3D model.
@@ -181,6 +183,7 @@ def test_wan_transformer() -> None:
     gc.collect()
 
 
+@pytest.mark.network
 def test_wan_text_encoder() -> None:
     """
     Tests a WanTransformer3D model.

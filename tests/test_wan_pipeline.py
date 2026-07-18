@@ -2,18 +2,27 @@ import os
 from typing import Optional
 
 import pytest
-import torch
-from diffusers.models import AutoencoderKLWan, WanTransformer3DModel
-from diffusers.pipelines import WanPipeline
-from diffusers.schedulers import UniPCMultistepScheduler
-from flashpack.integrations.diffusers import (
+
+pytest.importorskip("diffusers")
+pytest.importorskip("transformers")
+
+import torch  # noqa: E402
+from diffusers.models import AutoencoderKLWan, WanTransformer3DModel  # noqa: E402
+from diffusers.pipelines import WanPipeline  # noqa: E402
+from diffusers.schedulers import UniPCMultistepScheduler  # noqa: E402
+from flashpack.integrations.diffusers import (  # noqa: E402
     FlashPackDiffusersModelMixin,
     FlashPackDiffusionPipeline,
 )
-from flashpack.integrations.transformers import FlashPackTransformersModelMixin
-from flashpack.utils import timer
-from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer, UMT5EncoderModel
+from flashpack.integrations.transformers import (  # noqa: E402
+    FlashPackTransformersModelMixin,
+)
+from flashpack.utils import timer  # noqa: E402
+from huggingface_hub import snapshot_download  # noqa: E402
+from transformers import AutoTokenizer, UMT5EncoderModel  # noqa: E402
+
+# Downloads the Wan 2.1 pipeline from the Hub and runs video inference.
+pytestmark = [pytest.mark.gpu, pytest.mark.network]
 
 
 class FlashPackWanTransformer3DModel(

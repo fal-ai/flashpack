@@ -65,6 +65,9 @@ class TestPlanChunks:
         assert all(c[3] <= 4096 for c in chunks)
 
 
+@pytest.mark.skipif(
+    os.name != "posix", reason="_read_chunk uses os.preadv (POSIX-only)"
+)
 class TestReadChunk:
     def test_buffered_read_exact_bytes(self, tmp_path) -> None:
         payload = bytes(range(256)) * 512  # 128 KiB
