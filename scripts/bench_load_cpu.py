@@ -31,7 +31,6 @@ import threading
 import time
 
 import torch
-
 from flashpack.deserialization import (
     _build_macroblock_specs,
     _open_memmaps,
@@ -74,7 +73,9 @@ def alloc_dest(specs, aligned: bool):
     """Destination uint8 views per macroblock (+ keepalives)."""
     keep, views = [], []
     for spec in specs:
-        raw = torch.empty(spec.length_bytes + (ALIGN if aligned else 0), dtype=torch.uint8)
+        raw = torch.empty(
+            spec.length_bytes + (ALIGN if aligned else 0), dtype=torch.uint8
+        )
         off = (-raw.data_ptr()) % ALIGN if aligned else 0
         keep.append(raw)
         views.append(raw.narrow(0, off, spec.length_bytes))
@@ -146,7 +147,9 @@ def parallel_fill(path, specs, dest_views, n_threads, chunk_bytes, direct):
                     if item is None:
                         break
                     blk, f_off, b_off, ln = item
-                    read_chunk(fd_direct, fd_plain, mvs[blk][b_off : b_off + ln], f_off, ln)
+                    read_chunk(
+                        fd_direct, fd_plain, mvs[blk][b_off : b_off + ln], f_off, ln
+                    )
             finally:
                 os.close(fd_plain)
                 if fd_direct is not None:
@@ -212,7 +215,9 @@ def main():
     ap.add_argument("--chunk-mb", default="8,64")
     ap.add_argument("--cold", action="store_true")
     ap.add_argument("--no-verify", action="store_true")
-    ap.add_argument("--markdown-out", help="append results as a markdown table (CI job summary)")
+    ap.add_argument(
+        "--markdown-out", help="append results as a markdown table (CI job summary)"
+    )
     args = ap.parse_args()
 
     if args.pack:
@@ -233,7 +238,7 @@ def main():
         memmaps = _open_memmaps(path, specs)
         acc = 0
         for mm in memmaps:
-            acc += int(mm.view("uint8")[:: ALIGN].sum())
+            acc += int(mm.view("uint8")[::ALIGN].sum())
         return acc
 
     bench("mmap-touch", path, size, mmap_touch, args.cold, False)
@@ -247,7 +252,7 @@ def main():
             clones.append(torch.from_numpy(mm.view("uint8")).clone())
 
     bench("mmap-clone", path, size, mmap_clone, args.cold, False)
-    del clones
+    clones.clear()
 
     # 3. the shipped API paths: default (lazy mmap + touch) vs the opt-in
     #    eager parallel reader (FLASHPACK_CPU_PARALLEL_READ=1)
@@ -280,7 +285,7 @@ def main():
             specs,
             [b.view(torch.uint8) for b in api_result["storage"].blocks],
         )
-    del api_result
+    api_result.clear()
 
     threads = [int(t) for t in args.threads.split(",")]
     chunks = [int(c) * 1024 * 1024 for c in args.chunk_mb.split(",")]
@@ -302,7 +307,8 @@ def main():
                     specs,
                     views,
                 )
-                del keep, views
+                keep.clear()
+                views.clear()
 
     if args.markdown_out:
         write_markdown(args.markdown_out, size)
