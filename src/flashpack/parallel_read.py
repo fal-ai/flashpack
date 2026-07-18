@@ -27,12 +27,20 @@ fs-cache warm           9.3-11.0 s  1.9-2.6 s
 page-cache hot          1.25 s      1.2 s
 ======================  ==========  ============
 
+CPU targets can opt in to the same machinery (``FLASHPACK_CPU_PARALLEL_READ=1``):
+reader threads then ``preadv`` straight into the destination CPU tensors —
+no staging, no pinned memory, no streams — eagerly materializing the payload
+instead of returning lazy mmap views. Measured on local NVMe (8 GB pack):
+page-cache cold 1.2 s / 6.4 GB/s vs 3.2 s / 2.4 GB/s for faulting the mmap
+in; page-cache warm 0.4 s / 18 GB/s (on par with the mmap fast path).
+
 Tunables (environment):
 - ``FLASHPACK_PARALLEL_READ=0``      disable (use legacy path)
+- ``FLASHPACK_CPU_PARALLEL_READ=1``  enable eager parallel reads for CPU targets
 - ``FLASHPACK_READ_THREADS``         reader threads (default 16)
 - ``FLASHPACK_READ_CHUNK_BYTES``     chunk size (default 64 MiB)
 - ``FLASHPACK_DIRECT_IO=0``          never use O_DIRECT
-- ``FLASHPACK_CACHE_PINNED=0``       free pinned staging buffers after load
+- ``FLASHPACK_CACHE_PINNED=0``       free pinned staging buffers after load (CUDA)
 """
 
 import ctypes
@@ -42,6 +50,7 @@ import queue
 import threading
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -71,12 +80,24 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 def parallel_read_supported(device: torch.device) -> bool:
-    """Parallel fused reads only apply to CUDA targets on POSIX systems."""
-    return (
-        device.type == "cuda"
-        and os.name == "posix"
-        and _env_flag("FLASHPACK_PARALLEL_READ")
-    )
+    """Whether the parallel reader applies to ``device`` (POSIX only).
+
+    CUDA targets use it by default (``FLASHPACK_PARALLEL_READ=0`` disables).
+    CPU targets are opt-in via ``FLASHPACK_CPU_PARALLEL_READ=1``: the default
+    CPU path returns lazy mmap views (instant, zero RSS), while the parallel
+    reader eagerly materializes the payload into RAM — measured on an H100
+    node's local NVMe (8 GB pack, page-cache cold) it is ~2.6x faster than
+    faulting the mmap in (1.2 s / 6.4 GB/s vs 3.2 s / 2.4 GB/s), so it is the
+    right choice when the weights will all be read anyway (serving), but it
+    trades away mmap laziness — hence opt-in.
+    """
+    if os.name != "posix" or not _env_flag("FLASHPACK_PARALLEL_READ"):
+        return False
+    if device.type == "cuda":
+        return True
+    if device.type == "cpu":
+        return _env_flag("FLASHPACK_CPU_PARALLEL_READ", default=False)
+    return False
 
 
 # Pinned staging memory is expensive to allocate (~0.5 s/GB), so the pool is
@@ -136,10 +157,26 @@ def _page_cache_resident_fraction(path: str, size: int) -> float:
             vec = (ctypes.c_ubyte * npages)()
             buf = (ctypes.c_char * size).from_buffer(mm)
             libc = ctypes.CDLL(None, use_errno=True)
-            ret = libc.mincore(ctypes.addressof(buf), ctypes.c_size_t(size), vec)
+            # argtypes MUST be declared: without them ctypes converts the
+            # 64-bit address through C int, mincore gets a truncated pointer
+            # and fails, and this function reported 0.0 for every file — so
+            # the O_DIRECT gate never detected a warm page cache and warm
+            # loads paid the direct-IO path (measured ~5x on a hot 2.6 GB
+            # pack: 1.63 s vs 0.30 s buffered).
+            libc.mincore.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_ubyte),
+            ]
+            libc.mincore.restype = ctypes.c_int
+            ret = libc.mincore(
+                ctypes.c_void_p(ctypes.addressof(buf)), ctypes.c_size_t(size), vec
+            )
             if ret != 0:
                 return 0.0
-            resident = sum(v & 1 for v in vec)
+            # vectorized: a Python-level sum over the per-page vector costs
+            # ~0.3 s for an 8 GB file — real overhead on every load
+            resident = int((np.frombuffer(vec, dtype=np.uint8) & 1).sum())
             del buf
             return resident / npages
         finally:
@@ -201,6 +238,84 @@ def _plan_chunks(
     return chunks
 
 
+def _parallel_read_into_cpu_storage(
+    path: str,
+    specs: "list[MacroblockSpec]",
+    blocks: list[torch.Tensor],
+) -> None:
+    """CPU variant: N reader threads ``preadv`` file ranges straight into the
+    destination blocks' memory — no staging buffers, no pinned memory, no
+    streams. ``preadv`` releases the GIL, so plain Python threads scale to
+    the device ceiling. O_DIRECT is used under the same conditions as the
+    CUDA path (cache-cold file, 4K-aligned file offset) plus a 4K-aligned
+    destination address; every misaligned or failing chunk degrades to a
+    buffered read of identical bytes.
+    """
+    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+    chunk_bytes = max(_ALIGN, _env_int("FLASHPACK_READ_CHUNK_BYTES", 64 * 1024 * 1024))
+
+    byte_views = [b.view(torch.uint8) for b in blocks]
+    mvs = [memoryview(v.numpy()) for v in byte_views]
+    dest_ptrs = [v.data_ptr() for v in byte_views]
+
+    work: queue.SimpleQueue = queue.SimpleQueue()
+    chunks = _plan_chunks(specs, chunk_bytes)
+    for chunk in chunks:
+        work.put(chunk)
+    n_threads = min(n_threads, max(1, len(chunks)))
+    for _ in range(n_threads):
+        work.put(None)
+
+    size = os.path.getsize(path)
+    use_direct = (
+        _env_flag("FLASHPACK_DIRECT_IO")
+        and hasattr(os, "O_DIRECT")
+        and _page_cache_resident_fraction(path, size) < 0.9
+    )
+
+    errors: list[BaseException] = []
+
+    def _reader() -> None:
+        try:
+            fd_plain = os.open(path, os.O_RDONLY)
+            fd_direct = None
+            if use_direct:
+                try:
+                    fd_direct = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                except OSError:
+                    fd_direct = None
+            try:
+                while True:
+                    item = work.get()
+                    if item is None:
+                        break
+                    blk, f_off, b_off, ln = item
+                    # O_DIRECT also requires a 4K-aligned destination
+                    # address; misaligned chunks read buffered.
+                    fd_d = (
+                        fd_direct
+                        if (dest_ptrs[blk] + b_off) % _ALIGN == 0
+                        else None
+                    )
+                    _read_chunk(fd_d, fd_plain, mvs[blk][b_off : b_off + ln], f_off, ln)
+            finally:
+                os.close(fd_plain)
+                if fd_direct is not None:
+                    os.close(fd_direct)
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=_reader, daemon=True) for _ in range(n_threads)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
 def parallel_read_into_storage(
     path: str,
     specs: "list[MacroblockSpec]",
@@ -213,6 +328,10 @@ def parallel_read_into_storage(
     allocation the legacy path uses). Raises on any integrity error; never
     returns partially-filled storage silently.
     """
+    if device.type == "cpu":
+        _parallel_read_into_cpu_storage(path, specs, blocks)
+        return
+
     n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
     chunk_bytes = max(_ALIGN, _env_int("FLASHPACK_READ_CHUNK_BYTES", 64 * 1024 * 1024))
 

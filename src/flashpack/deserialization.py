@@ -285,6 +285,25 @@ def _allocate_empty_storage(
     return FlashTensorStorage(blocks=blocks)
 
 
+def _allocate_aligned_cpu_storage(specs: list[MacroblockSpec]) -> FlashTensorStorage:
+    """CPU blocks whose base address is 4096-byte aligned, so the parallel
+    reader's O_DIRECT fast path applies to whole macroblocks. torch's CPU
+    allocator only guarantees 64-byte alignment, so over-allocate raw bytes
+    and slice at the aligned offset (the view keeps the raw storage alive).
+    """
+    align = 4096
+    blocks: list[torch.Tensor] = []
+    for spec in specs:
+        raw = torch.empty(spec.length_bytes + align, dtype=torch.uint8)
+        off = (-raw.data_ptr()) % align
+        packing_dtype = get_packing_dtype(spec.dtype)
+        block = raw.narrow(0, off, spec.length_bytes).view(packing_dtype)
+        if spec.dtype != packing_dtype:
+            block = block.view(spec.dtype)
+        blocks.append(block)
+    return FlashTensorStorage(blocks=blocks)
+
+
 def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
     for block in storage.blocks:
         dist.broadcast(block, src=src)
@@ -308,6 +327,15 @@ def read_flashpack_file(
     device = torch.device(device) if isinstance(device, str) else device
 
     if device.type == "cpu":
+        if parallel_read_supported(device):
+            # Opt-in eager path (FLASHPACK_CPU_PARALLEL_READ=1): materialize
+            # the payload into RAM with parallel reads instead of returning
+            # lazy mmap views. See parallel_read.py for the measurements.
+            with timer("alloc_cpu_aligned", silent):
+                storage = _allocate_aligned_cpu_storage(specs)
+            with timer("read_and_copy", silent):
+                parallel_read_into_storage(path, specs, storage.blocks, device)
+            return storage, meta
         with timer("mmap_payload", silent):
             memmaps = _open_memmaps(path, specs)
         with timer("cpu_from_memmap", silent):
