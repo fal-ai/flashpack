@@ -38,3 +38,36 @@ jobs:
         # gpu/network tiers need a CUDA host and Hub downloads; CI runs the
         # hermetic CPU tier.
         run: pytest -m "not gpu and not network" -v
+
+  bench-cpu-load:
+    # Permanent benchmark of every CPU load operation (lazy mmap + touch,
+    # eager clone, the shipped api-cpu-default / api-cpu-parallel paths, and
+    # the raw preadv thread/chunk sweep), each bit-verified against the mmap
+    # reference. Results land in the job summary on every push/PR so load
+    # regressions are visible in review. Absolute numbers vary with the
+    # shared runner; treat them as trends, not SLOs. The CUDA variants need
+    # a GPU host — see scripts/bench_load_parallel.py, run manually.
+    name: CPU load benchmark (ubuntu, py3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU-only torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install flashpack
+        run: pip install -e ".[dev]"
+      - name: Benchmark CPU load methods (page-cache warm)
+        run: >-
+          python scripts/bench_load_cpu.py --size-gb 0.5 --dir "$RUNNER_TEMP"
+          --threads 1,2,4 --chunk-mb 8
+          --markdown-out "$GITHUB_STEP_SUMMARY"
+      - name: Benchmark CPU load methods (page-cache cold)
+        run: >-
+          python scripts/bench_load_cpu.py --size-gb 0.5 --dir "$RUNNER_TEMP"
+          --threads 1,2,4 --chunk-mb 8 --cold
+          --markdown-out "$GITHUB_STEP_SUMMARY"
