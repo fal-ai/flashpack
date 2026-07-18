@@ -200,6 +200,26 @@ def _copy_memmaps_into_storage(
     chunk_bytes: int,
     num_streams: int,
 ) -> None:
+    # Drain the copy streams even on error: an exception escaping while
+    # non-blocking H2D copies are still in flight lets the caller free the
+    # destination blocks, which the caching allocator may hand to a retry
+    # while the copy engine is still writing — silent weight corruption.
+    try:
+        _copy_memmaps_into_storage_inner(
+            memmaps, specs, storage, device, chunk_bytes, num_streams
+        )
+    finally:
+        torch.cuda.synchronize(device)
+
+
+def _copy_memmaps_into_storage_inner(
+    memmaps: list[np.memmap],
+    specs: list[MacroblockSpec],
+    storage: FlashTensorStorage,
+    device: torch.device,
+    chunk_bytes: int,
+    num_streams: int,
+) -> None:
     for idx, (mm, spec) in enumerate(zip(memmaps, specs)):
         total_elems = spec.length_elems
         elem_sz = torch.tensor([], dtype=spec.dtype).element_size()
