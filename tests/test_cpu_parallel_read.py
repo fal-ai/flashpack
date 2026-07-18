@@ -10,7 +10,6 @@ import os
 
 import pytest
 import torch
-
 from flashpack.deserialization import read_flashpack_file
 from flashpack.serialization import pack_to_file
 

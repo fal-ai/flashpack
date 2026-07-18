@@ -292,11 +292,7 @@ def _parallel_read_into_cpu_storage(
                     blk, f_off, b_off, ln = item
                     # O_DIRECT also requires a 4K-aligned destination
                     # address; misaligned chunks read buffered.
-                    fd_d = (
-                        fd_direct
-                        if (dest_ptrs[blk] + b_off) % _ALIGN == 0
-                        else None
-                    )
+                    fd_d = fd_direct if (dest_ptrs[blk] + b_off) % _ALIGN == 0 else None
                     _read_chunk(fd_d, fd_plain, mvs[blk][b_off : b_off + ln], f_off, ln)
             finally:
                 os.close(fd_plain)
@@ -305,9 +301,7 @@ def _parallel_read_into_cpu_storage(
         except BaseException as e:
             errors.append(e)
 
-    threads = [
-        threading.Thread(target=_reader, daemon=True) for _ in range(n_threads)
-    ]
+    threads = [threading.Thread(target=_reader, daemon=True) for _ in range(n_threads)]
     for t in threads:
         t.start()
     for t in threads:
