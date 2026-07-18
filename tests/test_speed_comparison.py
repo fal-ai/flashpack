@@ -1,16 +1,24 @@
 import os
 import time
 
-import matplotlib
-import safetensors.torch
-import torch
+import pytest
+
+pytest.importorskip("matplotlib")
+pytest.importorskip("transformers")
+
+import matplotlib  # noqa: E402
+import safetensors.torch  # noqa: E402
+import torch  # noqa: E402
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-from flashpack import assign_from_file, pack_to_file
-from huggingface_hub import snapshot_download
-from transformers import GPT2Model
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from flashpack import assign_from_file, pack_to_file  # noqa: E402
+from huggingface_hub import snapshot_download  # noqa: E402
+from transformers import GPT2Model  # noqa: E402
+
+# Downloads GPT-2 from the Hub and loads it onto a CUDA device.
+pytestmark = [pytest.mark.gpu, pytest.mark.network]
 
 
 def test_speed_comparison() -> None:

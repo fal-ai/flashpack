@@ -1,6 +1,11 @@
 import os
 from tempfile import TemporaryDirectory
 
+import pytest
+
+# Both tests download model weights from the Hugging Face Hub.
+pytestmark = pytest.mark.network
+
 
 def test_diffusers() -> None:
     """

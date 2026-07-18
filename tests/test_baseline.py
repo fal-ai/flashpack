@@ -1,7 +1,7 @@
 import gc
 import os
-import tempfile
 
+import pytest
 import torch
 import tqdm
 from flashpack import FlashPackMixin
@@ -83,9 +83,13 @@ def test_mixed_dtype_roundtrip(tmp_path) -> None:
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def test_load_unload() -> None:
+def test_load_unload(tmp_path) -> None:
     """
     Test that we can load and unload a model from a flash pack file.
+
+    Uses pytest's ``tmp_path`` (deferred, error-tolerant cleanup) rather than
+    ``TemporaryDirectory``: CPU loads keep the pack memory-mapped, and Windows
+    refuses to delete a file with a live mapping.
     """
 
     class TestModel(torch.nn.Module, FlashPackMixin):
@@ -98,16 +102,16 @@ def test_load_unload() -> None:
 
     model = TestModel(10)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "model.flashpack")
-        model.save_flashpack(path, target_dtype=torch.float32)
-        model2 = TestModel.from_flashpack(path, num_blocks=10)
-        assert model2.conv.weight.shape == model.conv.weight.shape
-        assert torch.allclose(model2.conv.weight, model.conv.weight)
-        assert model2.blocks[0].weight.shape == model.blocks[0].weight.shape
-        assert torch.allclose(model2.blocks[0].weight, model.blocks[0].weight)
+    path = os.path.join(tmp_path, "model.flashpack")
+    model.save_flashpack(path, target_dtype=torch.float32)
+    model2 = TestModel.from_flashpack(path, num_blocks=10)
+    assert model2.conv.weight.shape == model.conv.weight.shape
+    assert torch.allclose(model2.conv.weight, model.conv.weight)
+    assert model2.blocks[0].weight.shape == model.blocks[0].weight.shape
+    assert torch.allclose(model2.blocks[0].weight, model.blocks[0].weight)
 
 
+@pytest.mark.network
 def test_wan_transformer() -> None:
     """
     Tests a WanTransformer3D model.
@@ -181,6 +185,7 @@ def test_wan_transformer() -> None:
     gc.collect()
 
 
+@pytest.mark.network
 def test_wan_text_encoder() -> None:
     """
     Tests a WanTransformer3D model.
