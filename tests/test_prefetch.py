@@ -116,6 +116,7 @@ def test_prefetch_cold_runs_workers_to_completion(tmp_path, monkeypatch):
     assert handle._bytes_done == handle.size
 
 
+@posix_only
 def test_prefetch_is_idempotent_while_live(tmp_path, monkeypatch):
     _force_cold(monkeypatch)
     monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", _throttled_reader(0.02))
@@ -126,6 +127,7 @@ def test_prefetch_is_idempotent_while_live(tmp_path, monkeypatch):
     a.cancel()
 
 
+@posix_only
 def test_concurrent_prefetch_calls_share_one_handle(tmp_path, monkeypatch):
     _force_cold(monkeypatch)
     monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", _throttled_reader(0.02))
@@ -189,6 +191,7 @@ def test_prefetch_skips_files_larger_than_available_memory(tmp_path, monkeypatch
     assert handle.done and handle.error is None
 
 
+@posix_only
 def test_cancel_stops_promptly_and_settles(tmp_path, monkeypatch):
     path = _pack(tmp_path)
     monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", _throttled_reader(0.02))
@@ -200,6 +203,7 @@ def test_cancel_stops_promptly_and_settles(tmp_path, monkeypatch):
     assert handle.progress < 1.0
 
 
+@posix_only
 def test_prefetch_error_is_advisory(tmp_path, monkeypatch):
     path = _pack(tmp_path)
 
@@ -219,6 +223,23 @@ def test_prefetch_error_is_advisory(tmp_path, monkeypatch):
 def test_prefetch_missing_file_raises_loudly(tmp_path):
     with pytest.raises(FileNotFoundError):
         prefetch_flashpack_file(str(tmp_path / "nope.flashpack"))
+
+
+def test_prefetch_non_posix_is_noop(tmp_path, monkeypatch):
+    """Off POSIX the prefetch must return a pre-completed handle without
+    reading a byte (documented behavior; Windows runs this for real, on
+    POSIX we simulate)."""
+    path = _pack(tmp_path)
+    _force_cold(monkeypatch)
+    monkeypatch.setattr(prefetch_mod.os, "name", "nt")
+
+    def marker(*args, **kwargs):
+        raise AssertionError("non-posix prefetch must not read")
+
+    monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", marker)
+    handle = prefetch_flashpack_file(path)
+    assert handle.done and not handle.cancelled and handle.error is None
+    assert handle.progress == pytest.approx(1.0)
 
 
 def test_symlink_alias_shares_registry_key(tmp_path, monkeypatch):
