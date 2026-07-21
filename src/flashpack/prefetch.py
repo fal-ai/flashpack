@@ -12,9 +12,14 @@ fight the O_DIRECT gate:
 - The parallel reader settles the prefetch before choosing its I/O path
   (:func:`settle_prefetch`): a completed prefetch simply leaves a hot cache
   for the mincore gate to detect; an in-flight prefetch is either waited on
-  (nearly done) or cancelled (barely started) — never raced for bandwidth.
+  (nearly resident) or cancelled (barely started) — never raced for
+  bandwidth. Lazy-mmap and legacy CUDA loads deliberately do NOT settle:
+  their buffered page faults only benefit from a warm running ahead of
+  them; only the O_DIRECT-capable parallel reader must not race one.
 - Residency-gated: prefetching an already-hot file is an immediate no-op,
-  so repeated calls and multi-worker duplication cost nothing.
+  so repeated calls and multi-worker duplication cost nothing. Files
+  larger than the available physical memory are not warmed at all (the
+  warm would evict its own head before the load arrives).
 
 Why this replaces external prewarmers (``cattensors``, ``cat``-based
 directory warms) for flashpack files: an *uncoordinated* warm makes pages
@@ -26,11 +31,13 @@ failure mode: the gate decision happens after the prefetch settles, and the
 prefetch no-ops when the cache is already hot.
 
 Reads are always buffered (never O_DIRECT) — populating the page cache is
-the entire point.
+the entire point. POSIX-only: on other platforms every call returns a
+pre-completed no-op handle.
 """
 
 import os
 import threading
+import time
 
 from .parallel_read import _env_int, _page_cache_resident_fraction
 
@@ -51,6 +58,19 @@ _RESIDENT_FRACTION = 0.9
 # giving up and cancelling it (dead FUSE mounts should fail the load
 # through its own reads, not hang it inside the prefetch join).
 _SETTLE_WAIT_SECONDS = 120.0
+
+# Ceiling on how long cancel() waits for reader threads when invoked from
+# the settle path. A reader wedged inside a preadv on a dead mount must
+# not convert the settle into an unbounded hang — the readers are daemon
+# threads, and the load's own reads will surface the mount failure.
+_SETTLE_JOIN_SECONDS = 15.0
+
+
+def _available_memory_bytes() -> int | None:
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
 
 
 def _read_chunk_buffered(fd: int, scratch: memoryview, offset: int, want: int) -> int:
@@ -83,6 +103,10 @@ class FlashpackPrefetch:
         self._cancel = threading.Event()
         self._done = threading.Event()
         self._lock = threading.Lock()
+        # Serializes thread spawning against cancel(): cancel must never
+        # observe an appended-but-not-yet-started thread (join would raise),
+        # and a cancelled handle must never spawn readers at all.
+        self._spawn_lock = threading.Lock()
         self._bytes_done = 0
         self._workers_left = 0
         self._threads: list[threading.Thread] = []
@@ -100,7 +124,11 @@ class FlashpackPrefetch:
 
     @property
     def progress(self) -> float:
-        """Fraction of the file read so far (1.0 for empty files)."""
+        """Fraction of the file read so far (1.0 for empty files).
+
+        Bytes *read*, not bytes currently resident — under memory pressure
+        the page cache may already have evicted part of a large warm.
+        """
         if self.size == 0:
             return 1.0
         with self._lock:
@@ -112,16 +140,28 @@ class FlashpackPrefetch:
         """Block until the prefetch settles. Returns ``done``."""
         return self._done.wait(timeout)
 
-    def cancel(self, join: bool = True) -> None:
+    def cancel(self, join: bool = True, join_timeout: float | None = None) -> None:
         """Stop reading at the next chunk boundary.
 
-        With ``join=True`` (default) returns only after every reader thread
-        has exited, so no prefetch I/O competes with whatever runs next.
+        With ``join=True`` (default) waits for the reader threads so no
+        prefetch I/O competes with whatever runs next; ``join_timeout``
+        bounds that wait (total seconds across all threads) — a reader
+        wedged inside a read on a dead mount is abandoned as a daemon
+        thread rather than hanging the caller.
         """
-        self._cancel.set()
+        with self._spawn_lock:
+            self._cancel.set()
+            threads = list(self._threads)
         if join:
-            for t in self._threads:
-                t.join()
+            deadline = None if join_timeout is None else time.monotonic() + join_timeout
+            for t in threads:
+                if deadline is None:
+                    t.join()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    t.join(remaining)
         self._done.set()
 
     # -- internal ------------------------------------------------------
@@ -163,21 +203,51 @@ class FlashpackPrefetch:
                 if last:
                     self._done.set()
 
-        for i in range(n_threads):
-            start = i * bytes_per_thread
-            end = self.size if i == n_threads - 1 else (i + 1) * bytes_per_thread
-            t = threading.Thread(
-                target=_worker,
-                args=(start, end),
-                name=f"flashpack-prefetch-{os.path.basename(self.path)}-{i}",
-                daemon=True,
-            )
-            self._threads.append(t)
-            t.start()
+        with self._spawn_lock:
+            if self._cancel.is_set():
+                # A settle raced us between registration and start; the
+                # handle is already done — never spawn readers for it.
+                return
+            for i in range(n_threads):
+                start = i * bytes_per_thread
+                end = self.size if i == n_threads - 1 else (i + 1) * bytes_per_thread
+                t = threading.Thread(
+                    target=_worker,
+                    args=(start, end),
+                    name=f"flashpack-prefetch-{os.path.basename(self.path)}-{i}",
+                    daemon=True,
+                )
+                self._threads.append(t)
+                t.start()
 
 
 _REGISTRY: dict[str, FlashpackPrefetch] = {}
 _REGISTRY_LOCK = threading.Lock()
+
+
+def _registry_key(path: str) -> str:
+    # realpath: symlink aliases of the same pack must share one warm and
+    # one settle, or a load via the alias would race the warm via the target.
+    return os.path.realpath(path)
+
+
+def _after_fork_in_child() -> None:
+    """Forked children inherit the registry, but reader threads never
+    survive a fork: nothing would ever complete an inherited handle, so a
+    child's settle could stall (or deadlock on a lock that happened to be
+    held at the fork instant). Mark everything done and start fresh."""
+    global _REGISTRY_LOCK
+    _REGISTRY_LOCK = threading.Lock()
+    for handle in _REGISTRY.values():
+        handle._spawn_lock = threading.Lock()
+        handle._lock = threading.Lock()
+        handle._cancel.set()
+        handle._done.set()
+    _REGISTRY.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def prefetch_flashpack_file(
@@ -188,9 +258,16 @@ def prefetch_flashpack_file(
     """Start (or reuse) a background page-cache prefetch of ``path``.
 
     Returns immediately with a :class:`FlashpackPrefetch` handle. Idempotent
-    per path: concurrent/repeated calls share one live prefetch. If the file
-    is already page-cache-hot the handle is returned pre-completed and no
-    I/O happens.
+    per (real)path while a prefetch is live: concurrent/repeated calls share
+    one warm. A settled handle (finished, failed, or cancelled) is replaced
+    by a fresh one — the residency gate makes re-prefetching a still-hot
+    file a free no-op, while a genuinely evicted file gets re-warmed.
+
+    No-ops (returns a pre-completed handle) when: the platform is not
+    POSIX; the file is already page-cache-hot; or the file is larger than
+    the currently available physical memory (warming it would evict its own
+    head before the load arrives — the O_DIRECT cold path handles that case
+    better).
 
     The parallel reader settles any registered prefetch before it picks its
     I/O path, so calling this is always safe — it can only move work off
@@ -198,25 +275,32 @@ def prefetch_flashpack_file(
     tunables (``FLASHPACK_READ_THREADS``, capped at 8 for the buffered warm,
     and 16 MiB chunks via ``FLASHPACK_PREFETCH_CHUNK_BYTES``).
     """
-    ap = os.path.abspath(path)
-    size = os.path.getsize(ap)  # raises loudly on a bad path
+    key = _registry_key(path)
+    size = os.path.getsize(key)  # raises loudly on a bad path
 
     with _REGISTRY_LOCK:
-        existing = _REGISTRY.get(ap)
-        if existing is not None and not existing.cancelled:
+        existing = _REGISTRY.get(key)
+        if existing is not None and not existing.done:
             return existing
-        handle = FlashpackPrefetch(ap, size)
-        _REGISTRY[ap] = handle
+        handle = FlashpackPrefetch(key, size)
+        _REGISTRY[key] = handle
 
-    # Buffered warm saturates well below the O_DIRECT thread count; 8 is
-    # cattensors' long-serving production default.
     if n_threads is None:
+        # Buffered warm saturates well below the O_DIRECT thread count; 8
+        # is cattensors' long-serving production default.
         n_threads = min(8, _env_int("FLASHPACK_READ_THREADS", 16))
     if chunk_bytes is None:
         chunk_bytes = _env_int("FLASHPACK_PREFETCH_CHUNK_BYTES", 16 * 1024 * 1024)
     chunk_bytes = max(64 * 1024, chunk_bytes)
 
-    if size == 0 or _page_cache_resident_fraction(ap, size) >= _RESIDENT_FRACTION:
+    available = _available_memory_bytes()
+    skip = (
+        os.name != "posix"
+        or size == 0
+        or (available is not None and size > available * 0.9)
+        or _page_cache_resident_fraction(key, size) >= _RESIDENT_FRACTION
+    )
+    if skip:
         handle._complete_immediately()
         return handle
 
@@ -227,31 +311,49 @@ def prefetch_flashpack_file(
 def consume_prefetch(path: str) -> FlashpackPrefetch | None:
     """Pop and return the registered prefetch for ``path``, if any."""
     with _REGISTRY_LOCK:
-        return _REGISTRY.pop(os.path.abspath(path), None)
+        return _REGISTRY.pop(_registry_key(path), None)
 
 
-def settle_prefetch(path: str) -> None:
+def settle_prefetch(path: str, wait_timeout: float = _SETTLE_WAIT_SECONDS) -> None:
     """Settle any registered prefetch for ``path`` before a load reads it.
 
     Policy (mirrors the O_DIRECT gate threshold):
 
     - finished: nothing to do — the mincore gate will see the hot cache and
       route the load onto buffered reads at memory speed;
-    - nearly done (``progress >= 0.9``): wait for it — the remainder is
-      cheaper than abandoning the warm bytes, and the gate then sees a
-      stable hot cache;
-    - barely started: cancel it (joining its readers) — a cold O_DIRECT
-      load is faster than a buffered load racing its own warm.
+    - nearly there — most bytes read AND actually still resident
+      (``>= 0.9`` on both counts): wait for it (bounded), the remainder is
+      cheaper than abandoning the warm bytes;
+    - otherwise: cancel it (bounded join) — a cold O_DIRECT load is faster
+      than a buffered load racing its own warm. Bytes *read* are checked
+      against bytes *resident* because under memory pressure a large warm
+      can already have evicted its own head, in which case waiting buys a
+      stale cache and loses the O_DIRECT path.
 
-    Never raises: on a wait timeout the prefetch is cancelled and the load
-    proceeds on whatever the cache state is — the gate re-checks residency
-    itself, so partial warms and evictions self-correct.
+    Never raises. All waits and joins are bounded: a prefetch wedged on a
+    dead mount is abandoned (daemon threads) and the load proceeds to fail
+    — or succeed — through its own error-checked reads. Partial warms and
+    evictions self-correct because the gate re-checks residency itself.
+    The handle stays registered until it is settled, so concurrent loads of
+    the same path all settle the same warm.
     """
-    handle = consume_prefetch(path)
-    if handle is None or handle.done:
+    with _REGISTRY_LOCK:
+        handle = _REGISTRY.get(_registry_key(path))
+    if handle is None:
         return
-    if handle.progress >= _RESIDENT_FRACTION:
-        if not handle.wait(timeout=_SETTLE_WAIT_SECONDS):
-            handle.cancel()
-    else:
-        handle.cancel()
+    try:
+        if not handle.done:
+            worth_waiting = (
+                handle.progress >= _RESIDENT_FRACTION
+                and _page_cache_resident_fraction(handle.path, handle.size)
+                >= _RESIDENT_FRACTION
+            )
+            if worth_waiting:
+                if not handle.wait(timeout=wait_timeout):
+                    handle.cancel(join_timeout=_SETTLE_JOIN_SECONDS)
+            else:
+                handle.cancel(join_timeout=_SETTLE_JOIN_SECONDS)
+    finally:
+        with _REGISTRY_LOCK:
+            if _REGISTRY.get(handle.path) is handle:
+                del _REGISTRY[handle.path]

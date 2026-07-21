@@ -458,16 +458,17 @@ def iterate_from_flash_tensor(
 def revert_from_file(
     path: str,
     silent: bool = True,
-    eager_cpu: bool | None = True,
+    eager_cpu: bool | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Revert a flashpack file to a state dictionary.
 
-    Reverting reads every tensor by definition, so mmap laziness buys
-    nothing here — the payload is materialized eagerly with the parallel
-    reader by default (measured 2.2x faster than faulting the mmap in on a
-    page-cache-cold 8 GB pack). Pass ``eager_cpu=False`` to keep the lazy
-    mmap-backed views (e.g. when the caller only touches a subset).
+    Pass ``eager_cpu=True`` when every tensor will actually be consumed
+    (weight capture, packing pipelines): the payload is then materialized
+    with the parallel reader — measured 2.2x faster than faulting the mmap
+    in on a page-cache-cold 8 GB pack — at the cost of full-pack RSS. The
+    default keeps lazy mmap-backed views (near-zero anonymous RSS), which
+    is the right trade for streaming consumers like the CLI unpack path.
     """
     storage, meta = read_flashpack_file(path, silent=silent, eager_cpu=eager_cpu)
     state_dict = {}

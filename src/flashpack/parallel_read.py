@@ -332,9 +332,13 @@ def parallel_read_into_storage(
     """
     # Settle any background prefetch of this file before choosing an I/O
     # path: finished warms leave a hot cache for the mincore gate to route
-    # onto buffered reads; in-flight warms are waited on (nearly done) or
-    # cancelled (barely started) — never raced for bandwidth. Late import:
-    # prefetch.py imports this module at module level.
+    # onto buffered reads; in-flight warms are waited on (nearly resident)
+    # or cancelled (barely started) — never raced for bandwidth. Only THIS
+    # reader settles: the lazy-mmap CPU path and the legacy CUDA mmap walk
+    # read buffered through the page cache, so a warm running ahead of
+    # them only helps — the race is specific to O_DIRECT, which bypasses
+    # the cache the warm populates. Late import: prefetch.py imports this
+    # module at module level.
     from .prefetch import settle_prefetch
 
     settle_prefetch(path)
