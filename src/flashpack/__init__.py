@@ -5,6 +5,10 @@ from .deserialization import (
 )
 from .integrations import patch_integrations
 from .mixin import FlashPackMixin
+from .prefetch import (
+    FlashpackPrefetch,
+    prefetch_flashpack_file,
+)
 from .serialization import pack_to_file
 from .version import (
     __commit_id__,
@@ -17,6 +21,8 @@ from .version import (
 
 __all__ = [
     "FlashPackMixin",
+    "FlashpackPrefetch",
+    "prefetch_flashpack_file",
     "patch_integrations",
     "assign_from_file",
     "is_flashpack_file",

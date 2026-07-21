@@ -20,6 +20,7 @@ from .constants import (
     U64LE,
 )
 from .parallel_read import (
+    parallel_read_available,
     parallel_read_into_storage,
     parallel_read_supported,
 )
@@ -316,9 +317,18 @@ def read_flashpack_file(
     num_streams: int = DEFAULT_NUM_STREAMS,
     silent: bool = True,
     metadata: dict[str, Any] | None = None,
+    eager_cpu: bool | None = None,
 ) -> tuple[FlashTensorStorage, dict[str, Any]]:
     """
     Read the flashpack file and return the macroblock storage and metadata.
+
+    ``eager_cpu`` controls the CPU read strategy per call site: ``True``
+    eagerly materializes the payload into RAM with the parallel reader
+    (the right choice when every tensor will be read anyway), ``False``
+    forces lazy mmap views, and ``None`` (default) defers to the
+    ``FLASHPACK_CPU_PARALLEL_READ`` opt-in. Ignored for CUDA targets, and
+    downgraded to lazy mmap where the parallel reader is unavailable
+    (non-POSIX, ``FLASHPACK_PARALLEL_READ=0``).
     """
     with timer("read_metadata", silent):
         meta = metadata or get_flashpack_file_metadata(path)
@@ -327,10 +337,17 @@ def read_flashpack_file(
     device = torch.device(device) if isinstance(device, str) else device
 
     if device.type == "cpu":
-        if parallel_read_supported(device):
-            # Opt-in eager path (FLASHPACK_CPU_PARALLEL_READ=1): materialize
-            # the payload into RAM with parallel reads instead of returning
-            # lazy mmap views. See parallel_read.py for the measurements.
+        if eager_cpu is None:
+            use_eager = parallel_read_supported(device)
+        else:
+            # An explicit choice still requires the machinery to exist:
+            # honor the global kill switch and the POSIX-only reader.
+            use_eager = eager_cpu and parallel_read_available()
+        if use_eager:
+            # Eager path: materialize the payload into RAM with parallel
+            # reads instead of returning lazy mmap views. Reached via the
+            # FLASHPACK_CPU_PARALLEL_READ opt-in or an explicit
+            # ``eager_cpu=True``. See parallel_read.py for measurements.
             with timer("alloc_cpu_aligned", silent):
                 storage = _allocate_aligned_cpu_storage(specs)
             with timer("read_and_copy", silent):
@@ -441,11 +458,18 @@ def iterate_from_flash_tensor(
 def revert_from_file(
     path: str,
     silent: bool = True,
+    eager_cpu: bool | None = True,
 ) -> dict[str, torch.Tensor]:
     """
     Revert a flashpack file to a state dictionary.
+
+    Reverting reads every tensor by definition, so mmap laziness buys
+    nothing here — the payload is materialized eagerly with the parallel
+    reader by default (measured 2.2x faster than faulting the mmap in on a
+    page-cache-cold 8 GB pack). Pass ``eager_cpu=False`` to keep the lazy
+    mmap-backed views (e.g. when the caller only touches a subset).
     """
-    storage, meta = read_flashpack_file(path, silent=silent)
+    storage, meta = read_flashpack_file(path, silent=silent, eager_cpu=eager_cpu)
     state_dict = {}
     progress: tqdm.tqdm | None = None
 
