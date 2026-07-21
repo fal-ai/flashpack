@@ -31,8 +31,8 @@ failure mode: the gate decision happens after the prefetch settles, and the
 prefetch no-ops when the cache is already hot.
 
 Reads are always buffered (never O_DIRECT) — populating the page cache is
-the entire point. POSIX-only: on other platforms every call returns a
-pre-completed no-op handle.
+the entire point. Built for the Linux runners flashpack serves on; no
+platform fallbacks.
 """
 
 import os
@@ -74,16 +74,10 @@ def _available_memory_bytes() -> int | None:
 
 
 def _read_chunk_buffered(fd: int, scratch: memoryview, offset: int, want: int) -> int:
-    """Read up to ``want`` bytes at ``offset`` through the page cache.
-
-    Uses ``preadv`` into the reusable scratch buffer where available
-    (Linux/FreeBSD), falling back to ``pread`` (macOS). Returns bytes read
-    (0 at EOF).
-    """
-    if hasattr(os, "preadv"):
-        return os.preadv(fd, [scratch[:want]], offset)
-    # pragma: no cover - macOS fallback, exercised on darwin only
-    return len(os.pread(fd, want, offset))
+    """Read up to ``want`` bytes at ``offset`` through the page cache,
+    ``preadv``-ing into the reusable scratch buffer. Returns bytes read
+    (0 at EOF)."""
+    return os.preadv(fd, [scratch[:want]], offset)
 
 
 class FlashpackPrefetch:
@@ -246,6 +240,9 @@ def _after_fork_in_child() -> None:
     _REGISTRY.clear()
 
 
+# hasattr is import-safety only (flashpack/__init__ imports this module and
+# the repo's packing side still CI-tests Windows) — the prefetch engine
+# itself assumes Linux runners.
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork_in_child)
 
@@ -263,11 +260,10 @@ def prefetch_flashpack_file(
     by a fresh one — the residency gate makes re-prefetching a still-hot
     file a free no-op, while a genuinely evicted file gets re-warmed.
 
-    No-ops (returns a pre-completed handle) when: the platform is not
-    POSIX; the file is already page-cache-hot; or the file is larger than
-    the currently available physical memory (warming it would evict its own
-    head before the load arrives — the O_DIRECT cold path handles that case
-    better).
+    No-ops (returns a pre-completed handle) when the file is already
+    page-cache-hot, or when it is larger than the currently available
+    physical memory (warming it would evict its own head before the load
+    arrives — the O_DIRECT cold path handles that case better).
 
     The parallel reader settles any registered prefetch before it picks its
     I/O path, so calling this is always safe — it can only move work off
@@ -295,8 +291,7 @@ def prefetch_flashpack_file(
 
     available = _available_memory_bytes()
     skip = (
-        os.name != "posix"
-        or size == 0
+        size == 0
         or (available is not None and size > available * 0.9)
         or _page_cache_resident_fraction(key, size) >= _RESIDENT_FRACTION
     )

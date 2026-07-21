@@ -225,23 +225,6 @@ def test_prefetch_missing_file_raises_loudly(tmp_path):
         prefetch_flashpack_file(str(tmp_path / "nope.flashpack"))
 
 
-def test_prefetch_non_posix_is_noop(tmp_path, monkeypatch):
-    """Off POSIX the prefetch must return a pre-completed handle without
-    reading a byte (documented behavior; Windows runs this for real, on
-    POSIX we simulate)."""
-    path = _pack(tmp_path)
-    _force_cold(monkeypatch)
-    monkeypatch.setattr(prefetch_mod.os, "name", "nt")
-
-    def marker(*args, **kwargs):
-        raise AssertionError("non-posix prefetch must not read")
-
-    monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", marker)
-    handle = prefetch_flashpack_file(path)
-    assert handle.done and not handle.cancelled and handle.error is None
-    assert handle.progress == pytest.approx(1.0)
-
-
 def test_symlink_alias_shares_registry_key(tmp_path, monkeypatch):
     _force_cold(monkeypatch)
     monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", _throttled_reader(0.02))
