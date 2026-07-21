@@ -100,7 +100,7 @@ def timed_load(path: str, device: str, eager_cpu: bool | None):
     elif storage.backing_arrays is not None:
         # lazy mmap: fault everything in so the measurement is honest
         for block in storage.blocks:
-            block.view(torch.uint8)[:: 4096].sum()
+            block.view(torch.uint8)[::4096].sum()
     return storage, time.perf_counter() - t0
 
 
@@ -131,6 +131,12 @@ def run_scenario(
     if name in ("prefetch-overlap", "work-then-load"):
         busy_work(work_seconds)
 
+    resident_before_load = None
+    if handle is not None:
+        from flashpack.parallel_read import _page_cache_resident_fraction
+
+        resident_before_load = round(_page_cache_resident_fraction(path, size), 3)
+
     storage, load_s = timed_load(path, device, eager_cpu)
     total_s = time.perf_counter() - t_start
 
@@ -147,6 +153,7 @@ def run_scenario(
             "done": handle.done,
             "cancelled": handle.cancelled,
             "progress": round(handle.progress, 3),
+            "resident_before_load": resident_before_load,
         }
     del storage
     if device == "cuda":
@@ -172,6 +179,17 @@ def main() -> None:
         action="store_true",
         help="also measure mount-cold loads from a unique copy per repeat",
     )
+    ap.add_argument(
+        "--net-cold-packs",
+        help="comma-separated pack copies never read by this node; consumed "
+        "one scenario each (even index: load-only, odd: prefetch-overlap), "
+        "run FIRST so nothing warms them",
+    )
+    ap.add_argument(
+        "--expect-checksums",
+        help="JSON list of per-macroblock byte sums (from the seeding node); "
+        "skips the local reference load that would warm this node's cache",
+    )
     ap.add_argument("--json-out")
     args = ap.parse_args()
 
@@ -186,10 +204,39 @@ def main() -> None:
 
     eager_cpu = True if (args.device == "cpu" and args.eager_cpu) else None
 
-    print(f"reference load for bit-verification ({path})", flush=True)
-    ref_storage, _ = read_flashpack_file(path, device="cpu")
-    reference = checksum(ref_storage)
-    del ref_storage
+    if args.expect_checksums:
+        reference = json.loads(args.expect_checksums)
+        print("using seeded reference checksums", flush=True)
+    else:
+        print(f"reference load for bit-verification ({path})", flush=True)
+        ref_storage, _ = read_flashpack_file(path, device="cpu")
+        reference = checksum(ref_storage)
+        del ref_storage
+
+    results: list[dict] = []
+
+    # Network-cold tier first: each listed pack has never been read by this
+    # node, and each is consumed by exactly one scenario (any full read
+    # warms this node's mount cache for that file forever after).
+    if args.net_cold_packs:
+        packs = args.net_cold_packs.split(",")
+        for i, cold_pack in enumerate(packs):
+            name = "load-only" if i % 2 == 0 else "prefetch-overlap"
+            row = run_scenario(
+                name, cold_pack, args.device, eager_cpu, args.work_seconds, reference
+            )
+            row["repeat"] = i // 2
+            row["tier"] = "net-cold"
+            results.append(row)
+            print(json.dumps(row), flush=True)
+
+    # The fadvise tier's premise is "page cache cold, mount cache warm".
+    # With seeded checksums nothing has read the main pack on this node
+    # yet, so establish the premise explicitly before the first scenario.
+    if args.expect_checksums:
+        print("warming mount cache for the fadvise tier", flush=True)
+        make_hot(path)
+        evict_page_cache(path)
 
     scenarios = [
         "load-only",
@@ -199,7 +246,6 @@ def main() -> None:
         "settle-cancel",
         "load-hot",
     ]
-    results: list[dict] = []
     for rep in range(args.repeats):
         for name in scenarios:
             row = run_scenario(
