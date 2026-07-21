@@ -122,10 +122,18 @@ def evict_mount_cache(path: str) -> bool:
 
 
 def checksum(storage) -> list[int]:
-    return [
-        int(block.view(torch.uint8).to(torch.int64).sum().item())
-        for block in storage.blocks
-    ]
+    """Per-macroblock byte sums, chunked: a whole-block ``.to(torch.int64)``
+    is an 8x allocation (192 GB for a 24 GB pack) and gets the container
+    OOM-killed."""
+    step = 256 * 1024 * 1024
+    sums: list[int] = []
+    for block in storage.blocks:
+        b = block.reshape(-1).view(torch.uint8)
+        total = 0
+        for i in range(0, b.numel(), step):
+            total += int(b[i : i + step].to(torch.int64).sum().item())
+        sums.append(total)
+    return sums
 
 
 def busy_work(seconds: float) -> None:
