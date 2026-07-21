@@ -76,6 +76,51 @@ def make_hot(path: str) -> None:
             pass
 
 
+_JUICEFS_BIN: str | None = None
+
+
+def mount_cache_state(path: str) -> str | None:
+    """One-line summary of where the JuiceFS mount holds ``path``'s blocks
+    (``LOCAL``/``REMOTE``/``0%`` = object store). None without a client."""
+    if not _JUICEFS_BIN:
+        return None
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [_JUICEFS_BIN, "warmup", "--check", path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        lines = [
+            ln.strip() for ln in (proc.stdout + proc.stderr).splitlines() if ln.strip()
+        ]
+        return lines[-1][-160:] if lines else None
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        return f"check-failed: {e}"
+
+
+def evict_mount_cache(path: str) -> bool:
+    """Purge ``path`` from THIS node's JuiceFS NVMe cache (peers keep theirs:
+    with a peer holding blocks the next read is DC-cold, without one it goes
+    to the object store)."""
+    if not _JUICEFS_BIN:
+        return False
+    import subprocess
+
+    try:
+        subprocess.run(
+            [_JUICEFS_BIN, "warmup", "--evict", path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - advisory
+        return False
+
+
 def checksum(storage) -> list[int]:
     return [
         int(block.view(torch.uint8).to(torch.int64).sum().item())
@@ -111,16 +156,22 @@ def run_scenario(
     eager_cpu: bool | None,
     work_seconds: float,
     reference: list[int],
+    mount_evict: bool = False,
 ) -> dict:
     size = os.path.getsize(path)
     consume_prefetch(path)  # isolation between scenarios
 
+    mount_state = None
     if name == "load-hot":
         make_hot(path)
     else:
+        if mount_evict:
+            evict_mount_cache(path)
         evicted = evict_page_cache(path)
         if not evicted:
             print(f"WARNING: could not evict {path}; {name} tier is unreliable")
+        if mount_evict:
+            mount_state = mount_cache_state(path)
 
     t_start = time.perf_counter()
     handle = None
@@ -148,6 +199,8 @@ def run_scenario(
         "load_gbps": round(size / GB / load_s, 2) if load_s > 0 else None,
         "verified": ok,
     }
+    if mount_state is not None:
+        row["mount_cache_before"] = mount_state
     if handle is not None:
         row["prefetch"] = {
             "done": handle.done,
@@ -190,8 +243,23 @@ def main() -> None:
         help="JSON list of per-macroblock byte sums (from the seeding node); "
         "skips the local reference load that would warm this node's cache",
     )
+    ap.add_argument(
+        "--juicefs-bin",
+        help="path to a JuiceFS client; enables --evict-based mount-cache "
+        "control and per-scenario --check tier labels",
+    )
+    ap.add_argument(
+        "--object-cold",
+        action="store_true",
+        help="also measure load-only + prefetch-overlap on a locally-written "
+        "copy purged from the mount cache (no DC peer holds it -> object "
+        "store reads); requires --juicefs-bin",
+    )
     ap.add_argument("--json-out")
     args = ap.parse_args()
+
+    global _JUICEFS_BIN
+    _JUICEFS_BIN = args.juicefs_bin
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("cuda requested but unavailable")
@@ -223,12 +291,40 @@ def main() -> None:
         for i, cold_pack in enumerate(packs):
             name = "load-only" if i % 2 == 0 else "prefetch-overlap"
             row = run_scenario(
-                name, cold_pack, args.device, eager_cpu, args.work_seconds, reference
+                name,
+                cold_pack,
+                args.device,
+                eager_cpu,
+                args.work_seconds,
+                reference,
+                mount_evict=True,
             )
             row["repeat"] = i // 2
             row["tier"] = "net-cold"
             results.append(row)
             print(json.dumps(row), flush=True)
+
+    if args.object_cold and _JUICEFS_BIN:
+        # A copy written by THIS node: after --evict no DC peer holds its
+        # blocks, so reads go to the object store — the true node-cold tier.
+        for rep in range(args.repeats):
+            for name in ("load-only", "prefetch-overlap"):
+                oc = f"{path}.objcold"
+                shutil.copyfile(path, oc)
+                row = run_scenario(
+                    name,
+                    oc,
+                    args.device,
+                    eager_cpu,
+                    args.work_seconds,
+                    reference,
+                    mount_evict=True,
+                )
+                row["repeat"] = rep
+                row["tier"] = "object-cold"
+                results.append(row)
+                print(json.dumps(row), flush=True)
+                os.unlink(oc)
 
     # The fadvise tier's premise is "page cache cold, mount cache warm".
     # With seeded checksums nothing has read the main pack on this node
