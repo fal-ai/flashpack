@@ -75,6 +75,23 @@ def get_module_and_attribute(
     return module, name
 
 
+def require_zstandard():
+    """Import the optional ``zstandard`` dependency for fpz compression.
+
+    zstandard is not a hard dependency of flashpack; it is only needed to
+    write or read fpz-compressed packs. Install it with ``pip install
+    'flashpack[fpz]'`` (see the ``fpz`` extra in ``pyproject.toml``).
+    """
+    try:
+        import zstandard
+    except ImportError as e:  # pragma: no cover - exercised via message only
+        raise ImportError(
+            "fpz compression requires the optional 'zstandard' package. "
+            "Install it with: pip install 'flashpack[fpz]'"
+        ) from e
+    return zstandard
+
+
 def string_to_dtype(string: str) -> torch.dtype:
     """
     Convert a string to a torch.dtype.

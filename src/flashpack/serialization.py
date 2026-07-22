@@ -11,12 +11,23 @@ import tqdm
 from .constants import (
     DEFAULT_ALIGN_BYTES,
     DEFAULT_NUM_WRITE_WORKERS,
+    DEFAULT_ZSTD_LEVEL,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
+    FPZ_CODEC_SPLITPLANE_V1,
+    FPZ_COMPRESS_BF16,
+    FPZ_FRAME_ALIGN_BYTES,
+    FPZ_FRAME_UNCOMPRESSED_BYTES,
     MAGIC,
     U64LE,
 )
-from .utils import dtype_to_string, get_packing_dtype, timer, torch_dtype_to_numpy_dtype
+from .utils import (
+    dtype_to_string,
+    get_packing_dtype,
+    require_zstandard,
+    timer,
+    torch_dtype_to_numpy_dtype,
+)
 
 
 @dataclass
@@ -46,10 +57,23 @@ def pack_to_file(
     align_bytes: int = DEFAULT_ALIGN_BYTES,
     silent: bool = True,
     num_workers: int = DEFAULT_NUM_WRITE_WORKERS,
+    compress: str | None = None,
 ) -> None:
     """
     Pack the state dictionary or model to a flashpack file.
+
+    ``compress="fpz-bf16"`` enables split-plane zstd compression for bf16
+    macroblocks only (see ``constants.py``); every other dtype is stored
+    uncompressed, and the file falls back to the plain uncompressed format
+    when no bf16 macroblock is present. Requires the optional ``zstandard``
+    package.
     """
+    if compress is not None and compress != FPZ_COMPRESS_BF16:
+        raise ValueError(
+            f"Unsupported compress option: {compress!r} "
+            f"(expected None or {FPZ_COMPRESS_BF16!r})"
+        )
+
     if isinstance(state_dict_or_model, torch.nn.Module):
         state_dict = state_dict_or_model.state_dict()
     else:
@@ -268,6 +292,36 @@ def pack_to_file(
             # Flush memory map
             mm.flush()
 
+        # fpz path: re-emit the (now materialized) uncompressed payload as a
+        # compressed pack. bf16 macroblocks become split-plane zstd frames;
+        # every other block is copied through verbatim. When no block is
+        # eligible the file is identical to the uncompressed pack, so fall
+        # through to the normal footer path below.
+        compress_flags = [
+            compress == FPZ_COMPRESS_BF16 and block.dtype is torch.bfloat16
+            for block in macroblocks
+        ]
+        if any(compress_flags):
+            with timer("compress_and_write", silent):
+                _write_fpz_pack(
+                    source=mm,
+                    macroblocks=macroblocks,
+                    index=index,
+                    align_bytes=align_bytes,
+                    compress_flags=compress_flags,
+                    destination_path=destination_path,
+                    dest_dir=dest_dir,
+                )
+            # Close the uncompressed scratch memmap and drop it; the compressed
+            # file is already atomically in place at destination_path.
+            mm_base = getattr(mm, "_mmap", None) or getattr(mm, "base", None)
+            if mm_base is not None:
+                mm_base.close()
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            tmp_path = None
+            return
+
         # Append footer
         if len(macroblocks) == 1:
             block = macroblocks[0]
@@ -340,6 +394,157 @@ def pack_to_file(
 
     finally:
         # Cleanup on error
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _fpz_encode_block_to_file(
+    f,
+    block_bytes: np.ndarray,
+    compressor,
+) -> tuple[list[dict], int]:
+    """Encode one bf16 macroblock as split-plane zstd frames.
+
+    ``block_bytes`` is the contiguous uint8 payload of the (uncompressed)
+    macroblock. ``f`` is a binary file positioned at the macroblock start; it
+    is left positioned at the end of the written payload. Returns the frame
+    records and the on-disk length of the compressed payload in bytes.
+
+    bf16 elements are stored little-endian, so the even bytes are the low
+    (mantissa-LSB) plane -- kept raw -- and the odd bytes are the high
+    (sign+exponent) plane -- zstd-compressed. Each frame covers up to
+    ``FPZ_FRAME_UNCOMPRESSED_BYTES`` uncompressed bytes and its payload start
+    is padded to a 4096-byte boundary relative to the macroblock start.
+    """
+    block_start = f.tell()
+    n_total = int(block_bytes.shape[0])
+    frames: list[dict] = []
+    b = 0
+    while b < n_total:
+        n_out = min(FPZ_FRAME_UNCOMPRESSED_BYTES, n_total - b)
+        frame = block_bytes[b : b + n_out]
+        lo = np.ascontiguousarray(frame[0::2])
+        hi = np.ascontiguousarray(frame[1::2])
+        lo_bytes = lo.tobytes()
+        hi_z = compressor.compress(hi.tobytes())
+
+        # 4096-align this frame's payload start relative to the block start.
+        payload_off = f.tell() - block_start
+        pad = (-payload_off) % FPZ_FRAME_ALIGN_BYTES
+        if pad:
+            f.write(b"\x00" * pad)
+            payload_off += pad
+
+        f.write(lo_bytes)
+        f.write(hi_z)
+        frames.append(
+            {
+                "payload_off": int(payload_off),
+                "lo_len": int(len(lo_bytes)),
+                "hi_len": int(len(hi_z)),
+                "n_out": int(n_out),
+            }
+        )
+        b += n_out
+
+    on_disk_len = f.tell() - block_start
+    return frames, on_disk_len
+
+
+def _write_fpz_pack(
+    source: np.ndarray,
+    macroblocks: list[MacroblockPlan],
+    index: list[TensorIndexRecord],
+    align_bytes: int,
+    compress_flags: list[bool],
+    destination_path: str,
+    dest_dir: str,
+) -> None:
+    """Write a compressed (fpz) pack to ``destination_path`` atomically.
+
+    ``source`` is the flushed uint8 memmap holding the uncompressed payload;
+    each macroblock is read from it and either fpz-encoded (``compress_flags``)
+    or copied verbatim. Macroblock alignment mirrors the uncompressed planner
+    so non-compressed blocks land at the same relative boundaries.
+    """
+    zstandard = require_zstandard()
+    compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL)
+
+    fd_tmp, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=".packtmp_")
+    os.close(fd_tmp)
+    try:
+        macroblock_records: list[dict] = []
+        with open(tmp_path, "wb") as f:
+            for block_id, block in enumerate(macroblocks):
+                elem_size = torch.tensor([], dtype=block.dtype).element_size()
+                block_alignment = (
+                    math.lcm(align_bytes, elem_size) if align_bytes else elem_size
+                )
+                if block_alignment:
+                    pad = (-f.tell()) % block_alignment
+                    if pad:
+                        f.write(b"\x00" * pad)
+                block_offset = f.tell()
+
+                src_bytes = source[
+                    block.offset_bytes : block.offset_bytes + block.length_bytes
+                ]
+
+                record = {
+                    "dtype": dtype_to_string(block.dtype),
+                    "offset_bytes": int(block_offset),
+                    "length_elems": int(block.total_elems),
+                }
+                if compress_flags[block_id]:
+                    frames, on_disk_len = _fpz_encode_block_to_file(
+                        f, src_bytes, compressor
+                    )
+                    record["length_bytes"] = int(on_disk_len)
+                    record["fpz"] = {
+                        "codec": FPZ_CODEC_SPLITPLANE_V1,
+                        "frames": frames,
+                    }
+                else:
+                    f.write(src_bytes)
+                    record["length_bytes"] = int(block.length_bytes)
+                macroblock_records.append(record)
+
+            total_payload_bytes = f.tell()
+            meta_payload = {
+                "format": FILE_FORMAT_V4,
+                "align_bytes": int(align_bytes),
+                "total_payload_bytes": int(total_payload_bytes),
+                "total_elems": sum(block.total_elems for block in macroblocks),
+                "macroblocks": macroblock_records,
+                "index": [
+                    {
+                        "name": r.name,
+                        "shape": r.shape,
+                        "offset": int(r.offset),
+                        "length": int(r.length),
+                        "macroblock": int(r.macroblock),
+                    }
+                    for r in index
+                ],
+            }
+            footer_json = json.dumps(
+                meta_payload, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            f.write(footer_json)
+            f.write(U64LE.pack(len(footer_json)))
+            f.write(MAGIC)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+
+        os.replace(tmp_path, destination_path)
+        tmp_path = None
+    finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)

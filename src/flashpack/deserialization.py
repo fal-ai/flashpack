@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import queue
+import threading
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -16,6 +18,8 @@ from .constants import (
     DEFAULT_NUM_STREAMS,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
+    FPZ_CODEC_SPLITPLANE_V1,
+    FPZ_FRAME_UNCOMPRESSED_BYTES,
     MAGIC,
     U64LE,
 )
@@ -29,6 +33,7 @@ from .utils import (
     human_num_elements,
     is_ignored_tensor_name,
     maybe_init_distributed,
+    require_zstandard,
     string_to_dtype,
     timer,
     torch_dtype_to_numpy_dtype,
@@ -41,6 +46,15 @@ class MacroblockSpec:
     offset_bytes: int
     length_bytes: int
     length_elems: int
+    # For fpz-compressed blocks: the {"codec", "frames": [...]} record from the
+    # footer. None for plain (uncompressed) blocks. offset_bytes/length_bytes
+    # describe the compressed payload as stored; length_elems is always the
+    # logical (uncompressed) element count.
+    fpz: dict[str, Any] | None = None
+
+    @property
+    def uncompressed_bytes(self) -> int:
+        return self.length_elems * torch.tensor([], dtype=self.dtype).element_size()
 
 
 @dataclass
@@ -136,12 +150,18 @@ def _build_macroblock_specs(meta: dict[str, Any]) -> list[MacroblockSpec]:
             raise ValueError("Missing macroblock metadata for flashpack v4 file.")
         for block in macroblocks:
             dtype = string_to_dtype(block["dtype"])
+            fpz = block.get("fpz")
+            if fpz is not None:
+                codec = fpz.get("codec")
+                if codec != FPZ_CODEC_SPLITPLANE_V1:
+                    raise ValueError(f"Unsupported fpz codec: {codec!r}")
             specs.append(
                 MacroblockSpec(
                     dtype=dtype,
                     offset_bytes=int(block["offset_bytes"]),
                     length_bytes=int(block["length_bytes"]),
                     length_elems=int(block["length_elems"]),
+                    fpz=fpz,
                 )
             )
     else:
@@ -294,10 +314,15 @@ def _allocate_aligned_cpu_storage(specs: list[MacroblockSpec]) -> FlashTensorSto
     align = 4096
     blocks: list[torch.Tensor] = []
     for spec in specs:
-        raw = torch.empty(spec.length_bytes + align, dtype=torch.uint8)
+        # Size by the logical (uncompressed) byte count. This equals
+        # spec.length_bytes for plain blocks, but for fpz blocks length_bytes
+        # is the smaller compressed on-disk size, so the destination must be
+        # sized from the element count instead.
+        nbytes = spec.uncompressed_bytes
+        raw = torch.empty(nbytes + align, dtype=torch.uint8)
         off = (-raw.data_ptr()) % align
         packing_dtype = get_packing_dtype(spec.dtype)
-        block = raw.narrow(0, off, spec.length_bytes).view(packing_dtype)
+        block = raw.narrow(0, off, nbytes).view(packing_dtype)
         if spec.dtype != packing_dtype:
             block = block.view(spec.dtype)
         blocks.append(block)
@@ -307,6 +332,220 @@ def _allocate_aligned_cpu_storage(specs: list[MacroblockSpec]) -> FlashTensorSto
 def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
     for block in storage.blocks:
         dist.broadcast(block, src=src)
+
+
+def _pread_into(fd: int, offset: int, mv: memoryview) -> None:
+    """Fill ``mv`` from ``fd`` at ``offset`` with ``preadv`` (reused reader
+    machinery). Raises ``IOError`` on a short read (e.g. a truncated file)."""
+    n = len(mv)
+    got = 0
+    while got < n:
+        r = os.preadv(fd, [mv[got:]], offset + got)
+        if r <= 0:
+            raise IOError(f"short read: wanted {n} bytes at {offset}, got {got}")
+        got += r
+
+
+def _fpz_read_frame_planes(
+    fd: int, block_file_offset: int, frame: dict[str, Any], decompressor
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read one fpz frame and return its ``(lo, hi)`` byte planes as uint8
+    numpy arrays, each ``n_out // 2`` bytes.
+
+    This is the shared decode step for both the CPU and CUDA read paths: it
+    performs the file read (``preadv``) and the CPU zstd decode of the high
+    plane. A future GPU decoder (nvcomp) can replace only the decompress call
+    behind this same frame interface. The CPU path interleaves the planes with
+    numpy; the CUDA path H2D-copies them and interleaves with strided copies.
+    """
+    payload_off = int(frame["payload_off"])
+    lo_len = int(frame["lo_len"])
+    hi_len = int(frame["hi_len"])
+    n_out = int(frame["n_out"])
+    half = n_out - lo_len
+
+    lo_raw = bytearray(lo_len)
+    _pread_into(fd, block_file_offset + payload_off, memoryview(lo_raw))
+    hi_raw = bytearray(hi_len)
+    _pread_into(fd, block_file_offset + payload_off + lo_len, memoryview(hi_raw))
+
+    hi_bytes = decompressor.decompress(bytes(hi_raw), max_output_size=half)
+    lo = np.frombuffer(lo_raw, dtype=np.uint8)
+    hi = np.frombuffer(hi_bytes, dtype=np.uint8)
+    if lo_len * 2 != n_out or lo.shape[0] != lo_len or hi.shape[0] != half:
+        raise ValueError("fpz frame plane size mismatch")
+    return lo, hi
+
+
+def _fpz_decode_block_into_cpu(
+    fd: int, spec: MacroblockSpec, dst_u8: np.ndarray, decompressor
+) -> None:
+    """Decode every frame of an fpz block into ``dst_u8`` (uint8 view of the
+    uncompressed destination block). Interleaves the low/high planes so the
+    reconstructed bytes are identical to the uncompressed pack:
+    ``dst[0::2] = lo`` (low byte) and ``dst[1::2] = hi`` (high byte)."""
+    assert spec.fpz is not None
+    total = int(dst_u8.shape[0])
+    out_pos = 0
+    for frame in spec.fpz["frames"]:
+        lo, hi = _fpz_read_frame_planes(fd, spec.offset_bytes, frame, decompressor)
+        n_out = int(frame["n_out"])
+        if out_pos + n_out > total:
+            raise ValueError("fpz frames exceed the macroblock size")
+        seg = dst_u8[out_pos : out_pos + n_out]
+        seg[0::2] = lo
+        seg[1::2] = hi
+        out_pos += n_out
+    if out_pos != total:
+        raise ValueError(f"fpz frames cover {out_pos} bytes, expected {total}")
+
+
+def _fpz_read_into_cpu_storage(
+    path: str, specs: list[MacroblockSpec], blocks: list[torch.Tensor]
+) -> None:
+    """Fill pre-allocated (uncompressed-sized) CPU ``blocks`` from an fpz file.
+    fpz blocks are decoded frame-by-frame; plain blocks are read verbatim."""
+    zstandard = require_zstandard()
+    decompressor = zstandard.ZstdDecompressor()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for spec, block in zip(specs, blocks):
+            dst_u8 = block.view(torch.uint8).numpy()
+            if spec.fpz is None:
+                _pread_into(fd, spec.offset_bytes, memoryview(dst_u8))
+            else:
+                _fpz_decode_block_into_cpu(fd, spec, dst_u8, decompressor)
+    finally:
+        os.close(fd)
+
+
+def _fpz_read_into_cuda_storage(
+    path: str,
+    specs: list[MacroblockSpec],
+    blocks: list[torch.Tensor],
+    device: torch.device,
+) -> None:
+    """Fill pre-allocated device ``blocks`` from an fpz file with a pool of
+    reader threads (mirrors ``parallel_read_into_storage``).
+
+    Each reader owns a file descriptor, a CUDA stream, and reusable pinned/
+    device staging buffers. A work item is one fpz frame (or a whole plain
+    block); frames write disjoint destination segments so the readers never
+    collide. Per frame: read + CPU zstd-decode the planes (the shared
+    ``_fpz_read_frame_planes``; zstd releases the GIL), H2D the contiguous low
+    and decompressed-high planes, then two strided copies on the GPU
+    (``dst_u8[0::2] = lo``, ``dst_u8[1::2] = hi``). A GPU decoder (nvcomp) would
+    slot in by replacing the decompress inside ``_fpz_read_frame_planes``.
+
+    GPU-untested locally (no CUDA device); the frame read, decode, and plane
+    interleave are exercised by the CPU tests via the shared helpers above.
+    """
+    zstandard = require_zstandard()
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except ValueError:
+            return default
+
+    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+    half_cap = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
+
+    byte_blocks = [b.view(torch.uint8) for b in blocks]
+
+    # Order every reader stream after the destination allocation (same
+    # wait_event pattern as parallel_read_into_storage).
+    alloc_ready = torch.cuda.Event()
+    alloc_ready.record(torch.cuda.current_stream(device))
+
+    # Work items: ("frame", block_idx, frame, out_pos) or ("raw", block_idx, None, 0).
+    work: queue.SimpleQueue = queue.SimpleQueue()
+    n_tasks = 0
+    for idx, spec in enumerate(specs):
+        if spec.fpz is None:
+            work.put(("raw", idx, None, 0))
+            n_tasks += 1
+        else:
+            out_pos = 0
+            for frame in spec.fpz["frames"]:
+                work.put(("frame", idx, frame, out_pos))
+                out_pos += int(frame["n_out"])
+                n_tasks += 1
+    n_threads = min(n_threads, max(1, n_tasks))
+    for _ in range(n_threads):
+        work.put(None)
+
+    errors: list[BaseException] = []
+
+    def _reader() -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            decompressor = zstandard.ZstdDecompressor()
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_event(alloc_ready)
+            lo_pin = torch.empty(half_cap, dtype=torch.uint8, pin_memory=True)
+            hi_pin = torch.empty(half_cap, dtype=torch.uint8, pin_memory=True)
+            lo_dev = torch.empty(half_cap, dtype=torch.uint8, device=device)
+            hi_dev = torch.empty(half_cap, dtype=torch.uint8, device=device)
+            try:
+                while True:
+                    item = work.get()
+                    if item is None:
+                        break
+                    kind, blk, frame, out_pos = item
+                    dst = byte_blocks[blk]
+                    if kind == "raw":
+                        spec = specs[blk]
+                        buf = bytearray(spec.length_bytes)
+                        _pread_into(fd, spec.offset_bytes, memoryview(buf))
+                        host = torch.frombuffer(buf, dtype=torch.uint8)
+                        with torch.cuda.stream(stream):
+                            dst.copy_(host, non_blocking=False)
+                        continue
+                    spec = specs[blk]
+                    lo, hi = _fpz_read_frame_planes(
+                        fd, spec.offset_bytes, frame, decompressor
+                    )
+                    n_out = int(frame["n_out"])
+                    half = lo.shape[0]
+                    lo_pin[:half].copy_(torch.from_numpy(lo))
+                    hi_pin[:half].copy_(torch.from_numpy(hi))
+                    seg = dst.narrow(0, out_pos, n_out)
+                    with torch.cuda.stream(stream):
+                        lo_dev[:half].copy_(lo_pin[:half], non_blocking=True)
+                        hi_dev[:half].copy_(hi_pin[:half], non_blocking=True)
+                        seg[0::2].copy_(lo_dev[:half], non_blocking=True)
+                        seg[1::2].copy_(hi_dev[:half], non_blocking=True)
+                    stream.synchronize()
+            finally:
+                os.close(fd)
+            stream.synchronize()
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=_reader, daemon=True) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    torch.cuda.synchronize(device)
+    if errors:
+        raise errors[0]
+
+
+def _read_fpz_into_storage(
+    path: str, specs: list[MacroblockSpec], device: torch.device
+) -> FlashTensorStorage:
+    """Materialize an fpz (partially compressed) pack into ``device`` storage."""
+    if device.type == "cpu":
+        storage = _allocate_aligned_cpu_storage(specs)
+        _fpz_read_into_cpu_storage(path, specs, storage.blocks)
+        return storage
+    if device.type == "cuda":
+        storage = _allocate_empty_storage(specs, device)
+        _fpz_read_into_cuda_storage(path, specs, storage.blocks, device)
+        return storage
+    raise ValueError(f"Unsupported device: {device}")
 
 
 def read_flashpack_file(
@@ -325,6 +564,11 @@ def read_flashpack_file(
 
     specs = _build_macroblock_specs(meta)
     device = torch.device(device) if isinstance(device, str) else device
+
+    if any(spec.fpz is not None for spec in specs):
+        with timer("read_fpz", silent):
+            storage = _read_fpz_into_storage(path, specs, device)
+        return storage, meta
 
     if device.type == "cpu":
         if parallel_read_supported(device):

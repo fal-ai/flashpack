@@ -44,6 +44,9 @@ dev = [
     "pre-commit>=3.0.0",
     "setuptools-scm>=9.2.0",
 ]
+fpz = [
+    "zstandard>=0.22",
+]
 
 [tool.setuptools_scm]
 write_to = "src/flashpack/version.py"
