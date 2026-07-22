@@ -20,7 +20,7 @@ from .constants import (
     U64LE,
 )
 from .parallel_read import (
-    parallel_read_available,
+    _env_flag,
     parallel_read_into_storage,
     parallel_read_supported,
 )
@@ -340,9 +340,8 @@ def read_flashpack_file(
         if eager_cpu is None:
             use_eager = parallel_read_supported(device)
         else:
-            # An explicit choice still requires the machinery to exist:
-            # honor the global kill switch and the POSIX-only reader.
-            use_eager = eager_cpu and parallel_read_available()
+            # An explicit choice still honors the global kill switch.
+            use_eager = eager_cpu and _env_flag("FLASHPACK_PARALLEL_READ")
         if use_eager:
             # Eager path: materialize the payload into RAM with parallel
             # reads instead of returning lazy mmap views. Reached via the

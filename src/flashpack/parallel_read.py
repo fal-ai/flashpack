@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     from .deserialization import MacroblockSpec
 
 __all__ = [
-    "parallel_read_available",
     "parallel_read_supported",
     "parallel_read_into_storage",
     "release_pinned_pool",
@@ -80,15 +79,8 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return os.environ.get(name, "1" if default else "0") != "0"
 
 
-def parallel_read_available() -> bool:
-    """Whether the parallel reader machinery exists and is enabled at all
-    (POSIX platform, ``FLASHPACK_PARALLEL_READ`` not disabled) — independent
-    of the per-device-type policy in :func:`parallel_read_supported`."""
-    return os.name == "posix" and _env_flag("FLASHPACK_PARALLEL_READ")
-
-
 def parallel_read_supported(device: torch.device) -> bool:
-    """Whether the parallel reader applies to ``device`` (POSIX only).
+    """Whether the parallel reader applies to ``device``.
 
     CUDA targets use it by default (``FLASHPACK_PARALLEL_READ=0`` disables).
     CPU targets are opt-in via ``FLASHPACK_CPU_PARALLEL_READ=1``: the default
@@ -99,7 +91,7 @@ def parallel_read_supported(device: torch.device) -> bool:
     right choice when the weights will all be read anyway (serving), but it
     trades away mmap laziness — hence opt-in.
     """
-    if not parallel_read_available():
+    if not _env_flag("FLASHPACK_PARALLEL_READ"):
         return False
     if device.type == "cuda":
         return True
