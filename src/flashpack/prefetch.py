@@ -281,9 +281,9 @@ def prefetch_flashpack_file(
 
     The parallel reader settles any registered prefetch before it picks its
     I/O path, so calling this is always safe — it can only move work off
-    the load's critical path, never race it. Defaults follow the reader's
-    tunables (``FLASHPACK_READ_THREADS``, capped at 8 for the buffered warm,
-    and 16 MiB chunks via ``FLASHPACK_PREFETCH_CHUNK_BYTES``).
+    the load's critical path, never race it. Tunables:
+    ``FLASHPACK_PREFETCH_THREADS`` (default 2 — deliberately gentle, see
+    inline note) and ``FLASHPACK_PREFETCH_CHUNK_BYTES`` (default 16 MiB).
     """
     key = _registry_key(path)
     size = os.path.getsize(key)  # raises loudly on a bad path
@@ -296,9 +296,13 @@ def prefetch_flashpack_file(
         _REGISTRY[key] = handle
 
     if n_threads is None:
-        # Buffered warm saturates well below the O_DIRECT thread count; 8
-        # is cattensors' long-serving production default.
-        n_threads = min(8, _env_int("FLASHPACK_READ_THREADS", 16))
+        # Deliberately gentle: the warm has the entire import/setup window
+        # to work with, and every block it pulls is also WRITTEN to the
+        # mount's node-local cache — an aggressive warm competes with
+        # co-located reads (cold venv imports, other tenants) for the same
+        # NVMe. Measured on production H100s against a 25 GB pack: 2
+        # threads delivered at least the load benefit of 8.
+        n_threads = _env_int("FLASHPACK_PREFETCH_THREADS", 2)
     if chunk_bytes is None:
         chunk_bytes = _env_int("FLASHPACK_PREFETCH_CHUNK_BYTES", 16 * 1024 * 1024)
     chunk_bytes = max(64 * 1024, chunk_bytes)
