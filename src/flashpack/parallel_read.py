@@ -41,6 +41,7 @@ Tunables (environment):
 - ``FLASHPACK_READ_CHUNK_BYTES``     chunk size (default 64 MiB)
 - ``FLASHPACK_DIRECT_IO=0``          never use O_DIRECT
 - ``FLASHPACK_CACHE_PINNED=0``       free pinned staging buffers after load (CUDA)
+- ``FLASHPACK_PINNED_CACHE_BUNDLES``  max cached staging bundles (default 16)
 """
 
 import ctypes
@@ -100,36 +101,67 @@ def parallel_read_supported(device: torch.device) -> bool:
     return False
 
 
-# Pinned staging memory is expensive to allocate (~0.5 s/GB), so the pool is
-# kept for the process lifetime by default: model servers load all their
-# packs back-to-back at startup and the pool (threads x 2 x chunk, 2 GiB at
-# defaults) amortizes across them. Set FLASHPACK_CACHE_PINNED=0 or call
-# release_pinned_pool() to free it.
-_PINNED_POOL: dict = {}
+# Pinned staging memory is expensive to allocate (~0.5 s/GB), so freed
+# buffer bundles are cached for the process lifetime by default: model
+# servers load all their packs back-to-back at startup and the cache
+# (threads x 2 x chunk, 2 GiB at defaults) amortizes across them. Set
+# FLASHPACK_CACHE_PINNED=0 or call release_pinned_pool() to free it.
+#
+# Buffers are LEASED per load, never shared: two concurrent
+# read_flashpack_file calls previously received the SAME buffer objects and
+# silently copied each other's bytes onto the GPU (bit-exact packs, garbage
+# weights — the flux-2 checkerboard incident). A lease checks bundles out of
+# the free list under the lock; concurrent loads that outrun the cache
+# simply allocate fresh bundles and return them on release.
+_PINNED_FREE: dict = {}  # chunk_bytes -> list of [buf x _BUFFERS_PER_THREAD]
 _PINNED_POOL_LOCK = threading.Lock()
 
 
-def _get_pinned_pool(n_threads: int, chunk_bytes: int) -> list:
-    key = (n_threads, chunk_bytes)
+def _cached_bundle_cap() -> int:
+    """Max bundles kept in the free list (per process)."""
+    return max(0, _env_int("FLASHPACK_PINNED_CACHE_BUNDLES", 16))
+
+
+def _lease_pinned_bundles(n_threads: int, chunk_bytes: int) -> list:
+    """Check out ``n_threads`` exclusive staging bundles (allocating any
+    shortfall). Bundles are keyed by chunk size only, so loads with
+    different thread counts still reuse each other's buffers."""
+    bundles: list = []
     with _PINNED_POOL_LOCK:
-        pool = _PINNED_POOL.get(key)
-        if pool is None:
-            pool = [
-                [
-                    torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True)
-                    for _ in range(_BUFFERS_PER_THREAD)
-                ]
-                for _ in range(n_threads)
+        free = _PINNED_FREE.get(chunk_bytes)
+        while free and len(bundles) < n_threads:
+            bundles.append(free.pop())
+    while len(bundles) < n_threads:
+        bundles.append(
+            [
+                torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True)
+                for _ in range(_BUFFERS_PER_THREAD)
             ]
-            _PINNED_POOL.clear()  # hold at most one pool
-            _PINNED_POOL[key] = pool
-        return pool
+        )
+    return bundles
+
+
+def _release_pinned_bundles(chunk_bytes: int, bundles: list) -> None:
+    """Return leased bundles to the free list, capped; extras are dropped
+    (their pinned memory is freed by refcount)."""
+    with _PINNED_POOL_LOCK:
+        # hold bundles for at most one chunk size — a size change retires
+        # the old cache instead of pinning both generations forever
+        for key in list(_PINNED_FREE):
+            if key != chunk_bytes:
+                del _PINNED_FREE[key]
+        free = _PINNED_FREE.setdefault(chunk_bytes, [])
+        cap = _cached_bundle_cap()
+        for bundle in bundles:
+            if len(free) >= cap:
+                break
+            free.append(bundle)
 
 
 def release_pinned_pool() -> None:
     """Free the cached pinned staging buffers."""
     with _PINNED_POOL_LOCK:
-        _PINNED_POOL.clear()
+        _PINNED_FREE.clear()
 
 
 def _page_cache_resident_fraction(path: str, size: int) -> float:
@@ -358,7 +390,7 @@ def parallel_read_into_storage(
         and _page_cache_resident_fraction(path, size) < 0.9
     )
 
-    pool = _get_pinned_pool(n_threads, chunk_bytes)
+    pool = _lease_pinned_bundles(n_threads, chunk_bytes)
     errors: list[BaseException] = []
 
     def _reader(thread_idx: int) -> None:
@@ -411,12 +443,19 @@ def parallel_read_into_storage(
         threading.Thread(target=_reader, args=(i,), daemon=True)
         for i in range(n_threads)
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    torch.cuda.synchronize(device)
-    if not _env_flag("FLASHPACK_CACHE_PINNED"):
-        release_pinned_pool()
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        torch.cuda.synchronize(device)
+    finally:
+        # Buffers go back to the cache only after every reader thread has
+        # exited and the device synchronized — no in-flight H2D can source
+        # from a bundle the next load might lease.
+        if _env_flag("FLASHPACK_CACHE_PINNED"):
+            _release_pinned_bundles(chunk_bytes, pool)
+        else:
+            release_pinned_pool()
     if errors:
         raise errors[0]

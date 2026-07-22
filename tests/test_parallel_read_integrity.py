@@ -88,7 +88,8 @@ def cpu_parallel_read(monkeypatch):
         ]
 
     monkeypatch.setattr(parallel_read.torch, "cuda", _FakeCuda)
-    monkeypatch.setattr(parallel_read, "_get_pinned_pool", fake_pool)
+    monkeypatch.setattr(parallel_read, "_lease_pinned_bundles", fake_pool)
+    monkeypatch.setattr(parallel_read, "_release_pinned_bundles", lambda *a: None)
     monkeypatch.setenv("FLASHPACK_DIRECT_IO", "0")
     # Small defaults keep the fake staging pool tiny; tests override as needed.
     monkeypatch.setenv("FLASHPACK_READ_THREADS", "4")
