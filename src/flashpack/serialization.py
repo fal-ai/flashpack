@@ -471,7 +471,10 @@ def _write_fpz_pack(
     so non-compressed blocks land at the same relative boundaries.
     """
     zstandard = require_zstandard()
-    compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL)
+    # threads=-1 = one worker per core: a ~19GB high plane at single-threaded
+    # zstd-3 (~0.4 GB/s) would take ~45 min per repack; multithreaded frames
+    # keep converter jobs in minutes. Frame outputs are byte-compatible.
+    compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL, threads=-1)
 
     fd_tmp, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=".packtmp_")
     os.close(fd_tmp)
