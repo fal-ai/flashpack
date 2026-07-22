@@ -67,10 +67,21 @@ _SETTLE_JOIN_SECONDS = 15.0
 
 
 def _available_memory_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo — includes reclaimable page cache.
+
+    NOT ``sysconf(SC_AVPHYS_PAGES)``: that counts only free pages, and on a
+    long-running node the page cache keeps free-RAM near zero, which made
+    this guard spuriously no-op every prefetch (caught on a production
+    runner against qwen-image-2512's real pack).
+    """
     try:
-        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError, AttributeError):
-        return None
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _read_chunk_buffered(fd: int, scratch: memoryview, offset: int, want: int) -> int:
@@ -94,6 +105,9 @@ class FlashpackPrefetch:
         self.path = path
         self.size = size
         self.error: BaseException | None = None
+        #: why a pre-completed handle skipped the warm: "hot", "memory",
+        #: "empty" — None for a prefetch that actually ran.
+        self.skipped_reason: str | None = None
         self._cancel = threading.Event()
         self._done = threading.Event()
         self._lock = threading.Lock()
@@ -290,12 +304,13 @@ def prefetch_flashpack_file(
     chunk_bytes = max(64 * 1024, chunk_bytes)
 
     available = _available_memory_bytes()
-    skip = (
-        size == 0
-        or (available is not None and size > available * 0.9)
-        or _page_cache_resident_fraction(key, size) >= _RESIDENT_FRACTION
-    )
-    if skip:
+    if size == 0:
+        handle.skipped_reason = "empty"
+    elif available is not None and size > available * 0.9:
+        handle.skipped_reason = "memory"
+    elif _page_cache_resident_fraction(key, size) >= _RESIDENT_FRACTION:
+        handle.skipped_reason = "hot"
+    if handle.skipped_reason is not None:
         handle._complete_immediately()
         return handle
 

@@ -175,6 +175,7 @@ def test_prefetch_hot_file_is_immediate_noop(tmp_path, monkeypatch):
     monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", marker)
     handle = prefetch_flashpack_file(path)
     assert handle.done
+    assert handle.skipped_reason == "hot"
     assert handle.progress == pytest.approx(1.0)
 
 
@@ -189,6 +190,7 @@ def test_prefetch_skips_files_larger_than_available_memory(tmp_path, monkeypatch
     monkeypatch.setattr(prefetch_mod, "_read_chunk_buffered", marker)
     handle = prefetch_flashpack_file(path)
     assert handle.done and handle.error is None
+    assert handle.skipped_reason == "memory"
 
 
 @posix_only
