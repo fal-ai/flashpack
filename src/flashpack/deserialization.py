@@ -309,7 +309,31 @@ def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
         dist.broadcast(block, src=src)
 
 
-def read_flashpack_file(
+def _timing_path_tail(p) -> str:
+    """Last two path components — unique enough per pack within one boot
+    (basenames like transformer.flashpack repeat across model variants)."""
+    parts = str(p).replace("\\", "/").rsplit("/", 2)
+    return "/".join(parts[-2:])
+
+
+def read_flashpack_file(*args, **kwargs):
+    from time import perf_counter
+
+    from flashpack._timing import fire as _timing_fire
+
+    _t0 = perf_counter()
+    try:
+        return _read_flashpack_file_impl(*args, **kwargs)
+    finally:
+        _timing_fire(
+            "weight_load",
+            perf_counter() - _t0,
+            detail="flashpack_read,"
+            + _timing_path_tail(args[0] if args else kwargs.get("path", "?")),
+        )
+
+
+def _read_flashpack_file_impl(
     path: str,
     device: str | torch.device = "cpu",
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
@@ -438,7 +462,19 @@ def iterate_from_flash_tensor(
             raise ValueError(f"Could not get tensor for record {rec}") from e
 
 
-def revert_from_file(
+def revert_from_file(*args, **kwargs):
+    from time import perf_counter
+
+    from flashpack._timing import fire as _timing_fire
+
+    _t0 = perf_counter()
+    try:
+        return _revert_from_file_impl(*args, **kwargs)
+    finally:
+        _timing_fire("weight_load", perf_counter() - _t0, detail="flashpack_revert_envelope," + _timing_path_tail(args[0] if args else kwargs.get("path", "?")))
+
+
+def _revert_from_file_impl(
     path: str,
     silent: bool = True,
 ) -> dict[str, torch.Tensor]:
@@ -460,7 +496,19 @@ def revert_from_file(
     return state_dict
 
 
-def assign_from_file(
+def assign_from_file(*args, **kwargs):
+    from time import perf_counter
+
+    from flashpack._timing import fire as _timing_fire
+
+    _t0 = perf_counter()
+    try:
+        return _assign_from_file_impl(*args, **kwargs)
+    finally:
+        _timing_fire("weight_load", perf_counter() - _t0, detail="flashpack_assign_envelope," + _timing_path_tail(args[1] if len(args) > 1 else kwargs.get("path", "?")))
+
+
+def _assign_from_file_impl(
     model: torch.nn.Module,
     path: str,
     device: str | torch.device | None = None,
