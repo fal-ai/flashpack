@@ -478,3 +478,77 @@ def test_v2_ratio_close_to_v1(tmp_path, monkeypatch, capsys) -> None:
         )
     assert v2_sz < plain_sz  # v2 still compresses
     assert v2_sz <= v1_sz * 1.25  # within a modest margin of v1
+
+
+# --------------------------------------------------------------------------
+# v2 parameterized chunk size
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chunk_bytes", [64 * 1024, 256 * 1024, 1024 * 1024])
+def test_v2_roundtrip_at_various_chunk_sizes(tmp_path, chunk_bytes) -> None:
+    # A 2048x1024 bf16 tensor has a 2 MiB high plane -> several chunks at each
+    # size; every size must round-trip bit-exactly and record its chunk size.
+    ramp = (torch.arange(2048 * 1024, dtype=torch.float32) * 0.01).reshape(2048, 1024)
+    source = {"w": ramp.to(torch.bfloat16)}
+    comp = _pack(
+        tmp_path,
+        source,
+        f"c{chunk_bytes}.flashpack",
+        compress="fpz-bf16",
+        hi_chunk_bytes=chunk_bytes,
+    )
+    block = get_flashpack_file_metadata(comp)["macroblocks"][0]
+    assert block["fpz"]["hi_chunk_usize"] == chunk_bytes  # footer field present
+    assert len(block["fpz"]["frames"][0]["hi_chunks"]) >= 2
+
+    storage, meta = read_flashpack_file(comp, device="cpu")
+    (w,) = [t for _, t in iterate_from_flash_tensor(storage, meta)]
+    assert torch.equal(_uint16_view(w), _uint16_view(source["w"]))
+
+
+def test_env_sets_v2_chunk_size(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FLASHPACK_FPZ_CHUNK_BYTES", str(256 * 1024))
+    source = {"w": torch.randn(1024, 512).to(torch.bfloat16)}
+    comp = _pack(tmp_path, source, "comp.flashpack", compress="fpz-bf16")
+    block = get_flashpack_file_metadata(comp)["macroblocks"][0]
+    assert block["fpz"]["hi_chunk_usize"] == 256 * 1024
+
+
+def test_v2_reader_defaults_chunk_size_when_field_absent(tmp_path) -> None:
+    # Back-compat: a v2 pack written before hi_chunk_usize existed (field
+    # absent) must decode with the 64 KiB default. The default pack uses 64 KiB,
+    # so dropping the field and re-reading must still be bit-exact.
+    source = {"w": torch.randn(1024, 512).to(torch.bfloat16)}
+    comp = _pack(tmp_path, source, "comp.flashpack", compress="fpz-bf16")
+    meta = get_flashpack_file_metadata(comp)
+    del meta["macroblocks"][0]["fpz"]["hi_chunk_usize"]
+
+    storage, m = read_flashpack_file(comp, device="cpu", metadata=meta)
+    (w,) = [t for _, t in iterate_from_flash_tensor(storage, m)]
+    assert torch.equal(_uint16_view(w), _uint16_view(source["w"]))
+
+
+@pytest.mark.parametrize("bad", [4097, 1000, 64 * 1024 + 1])
+def test_hi_chunk_bytes_must_be_multiple_of_align(tmp_path, bad) -> None:
+    with pytest.raises(ValueError, match="multiple"):
+        pack_to_file(
+            {"w": torch.randn(64).to(torch.bfloat16)},
+            str(tmp_path / "p.flashpack"),
+            target_dtype=None,
+            compress="fpz-bf16",
+            hi_chunk_bytes=bad,
+        )
+
+
+def test_hi_chunk_bytes_too_large_rejected(tmp_path) -> None:
+    from flashpack.constants import FPZ_FRAME_UNCOMPRESSED_BYTES
+
+    with pytest.raises(ValueError, match="exceeds"):
+        pack_to_file(
+            {"w": torch.randn(64).to(torch.bfloat16)},
+            str(tmp_path / "p.flashpack"),
+            target_dtype=None,
+            compress="fpz-bf16",
+            hi_chunk_bytes=FPZ_FRAME_UNCOMPRESSED_BYTES,
+        )

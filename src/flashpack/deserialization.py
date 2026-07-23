@@ -383,17 +383,23 @@ def _fpz_frame_tasks(specs: list[MacroblockSpec]) -> list[tuple]:
 
 
 def _fpz_read_frame_planes(
-    fd: int, block_file_offset: int, frame: dict[str, Any], decompressor
+    fd: int,
+    block_file_offset: int,
+    frame: dict[str, Any],
+    decompressor,
+    chunk_u: int = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read one fpz frame and return its ``(lo, hi)`` byte planes as uint8
     numpy arrays, each ``n_out // 2`` bytes.
 
     Shared CPU decode step for both read paths and both codec versions. v1
     frames store the high plane as a single zstd frame (``hi_len``); v2 frames
-    store it as many ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` chunks whose compressed
-    lengths are in ``hi_chunks``. zstd ``decompress`` releases the GIL and takes
-    the compressed input as a buffer, so read targets are ``memoryview``s (no
-    intermediate ``bytes`` copy) and N threads scale near linearly.
+    store it as many ``chunk_u``-uncompressed-byte chunks whose compressed
+    lengths are in ``hi_chunks`` (``chunk_u`` is the block's ``hi_chunk_usize``,
+    defaulting to the pre-parameterization 64 KiB when absent). zstd
+    ``decompress`` releases the GIL and takes the compressed input as a buffer,
+    so read targets are ``memoryview``s (no intermediate ``bytes`` copy) and N
+    threads scale near linearly.
     """
     payload_off = int(frame["payload_off"])
     lo_len = int(frame["lo_len"])
@@ -407,7 +413,6 @@ def _fpz_read_frame_planes(
 
     if "hi_chunks" in frame:
         # v2: decode each chunk (a standalone zstd frame) into its slice.
-        chunk_u = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
         hi = np.empty(half, dtype=np.uint8)
         uoff = 0
         src_off = hi_base
@@ -483,8 +488,13 @@ def _fpz_read_into_cpu_storage(
                         )
                         continue
                     spec = specs[blk]
+                    chunk_u = int(
+                        (spec.fpz or {}).get(
+                            "hi_chunk_usize", FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
+                        )
+                    )
                     lo, hi = _fpz_read_frame_planes(
-                        fd, spec.offset_bytes, frame, decompressor
+                        fd, spec.offset_bytes, frame, decompressor, chunk_u
                     )
                     n_out = int(frame["n_out"])
                     seg = dst_u8[blk][out_pos : out_pos + n_out]
@@ -608,10 +618,16 @@ def _fpz_read_into_cuda_storage(
                     events[slot].synchronize()
 
                     n_out = int(frame["n_out"])
+                    spec = specs[blk]
+                    chunk_u = int(
+                        (spec.fpz or {}).get(
+                            "hi_chunk_usize", FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
+                        )
+                    )
                     # Shared CPU decode (handles both v1 single-frame and v2
                     # chunked high planes), then copy both planes into pinned.
                     lo_np, hi_np = _fpz_read_frame_planes(
-                        fd, specs[blk].offset_bytes, frame, decompressor
+                        fd, spec.offset_bytes, frame, decompressor, chunk_u
                     )
                     half = int(hi_np.shape[0])
                     lo_pin[slot].numpy()[:half] = lo_np
@@ -981,7 +997,14 @@ def _fpz_read_into_cuda_storage_gpu(
     blocks take the same whole-block H2D as the CPU-decode path.
     """
     half_cap = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
+    # A pack is written with one chunk size; read it from the first fpz block
+    # (absent for pre-parameterization v2 packs -> the 64 KiB default). A frame
+    # whose block disagrees is caught by the chunk-count check in the loop.
     chunk_u = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
+    for spec in specs:
+        if spec.fpz is not None:
+            chunk_u = int(spec.fpz.get("hi_chunk_usize", chunk_u))
+            break
     max_chunks = (half_cap + chunk_u - 1) // chunk_u
     # Upper bound on a frame's whole compressed-high blob: the zstd bound for
     # half_cap uncompressed, plus per-chunk zstd frame-header overhead.
@@ -1106,6 +1129,7 @@ def _fpz_read_into_cuda_storage_gpu(
             configs: dict[tuple[int, ...], object] = {}
             batch_idx = 0
             t_pread = t_h2d = t_decode = t_interleave = t_evsync = t_final = 0.0
+            t_wrap = 0.0
             n_batches = n_frames_done = n_cfg = 0
             try:
                 while True:
@@ -1190,6 +1214,10 @@ def _fpz_read_into_cuda_storage_gpu(
                             t_h2d += time.perf_counter() - _t
                         # One src Array per compressed chunk (exact length) and
                         # its hoisted out wrapper; chunk usizes drive the config.
+                        # This per-chunk wrapper building is GIL-bound Python and
+                        # is the dominant residual cost at small chunk sizes --
+                        # its own trace bucket so its share is visible.
+                        _t = time.perf_counter() if trace_on else 0.0
                         coff = hiz_off
                         for j, clen in enumerate(hi_chunks):
                             clen = int(clen)
@@ -1199,6 +1227,8 @@ def _fpz_read_into_cuda_storage_gpu(
                             outs.append(out_wrap[slot][k * max_chunks + j])
                             coff += clen
                         sig_parts.extend(usizes)
+                        if trace_on:
+                            t_wrap += time.perf_counter() - _t
 
                     # Reusable config per chunk-shape signature: build once (one
                     # sync, waits on the H2D above), then decode sync-free here
@@ -1251,7 +1281,8 @@ def _fpz_read_into_cuda_storage_gpu(
                     f"[fpz-gpu-trace] thread={thread_idx} frames={n_frames_done} "
                     f"batches={n_batches} cfg_builds={n_cfg} "
                     f"pread={t_pread:.3f}s h2d_enq={t_h2d:.3f}s "
-                    f"decode={t_decode:.3f}s interleave_enq={t_interleave:.3f}s "
+                    f"wrap={t_wrap:.3f}s decode={t_decode:.3f}s "
+                    f"interleave_enq={t_interleave:.3f}s "
                     f"evsync={t_evsync:.3f}s final_sync={t_final:.3f}s"
                 )
                 with traces_lock:

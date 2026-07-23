@@ -51,6 +51,35 @@ class MacroblockPlan:
     tensors: list[TensorIndexRecord]
 
 
+def _resolve_hi_chunk_bytes(hi_chunk_bytes: int | None) -> int:
+    """Resolve and validate the v2 high-plane chunk size.
+
+    Precedence: explicit ``hi_chunk_bytes`` arg > ``FLASHPACK_FPZ_CHUNK_BYTES``
+    env (for the converter) > ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` default. An
+    explicitly requested value must be a positive multiple of
+    ``FPZ_FRAME_ALIGN_BYTES`` and no larger than a frame's high plane
+    (``FPZ_FRAME_UNCOMPRESSED_BYTES // 2``). The default is clamped to the frame
+    high plane rather than rejected (a chunk >= the high plane just yields one
+    chunk per frame -- the case tests hit by shrinking the frame size).
+    """
+    half_frame = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
+    env = os.environ.get("FLASHPACK_FPZ_CHUNK_BYTES")
+    if hi_chunk_bytes is None and not env:
+        return max(1, min(FPZ_HI_CHUNK_UNCOMPRESSED_BYTES, half_frame))
+    requested = hi_chunk_bytes if hi_chunk_bytes is not None else int(env)
+    if requested < FPZ_FRAME_ALIGN_BYTES or requested % FPZ_FRAME_ALIGN_BYTES:
+        raise ValueError(
+            f"hi_chunk_bytes must be a positive multiple of "
+            f"{FPZ_FRAME_ALIGN_BYTES} (got {requested})"
+        )
+    if requested > half_frame:
+        raise ValueError(
+            f"hi_chunk_bytes ({requested}) exceeds the frame high-plane "
+            f"size ({half_frame})"
+        )
+    return requested
+
+
 def pack_to_file(
     state_dict_or_model: dict[str, torch.Tensor] | torch.nn.Module,
     destination_path: str,
@@ -60,6 +89,7 @@ def pack_to_file(
     silent: bool = True,
     num_workers: int = DEFAULT_NUM_WRITE_WORKERS,
     compress: str | None = None,
+    hi_chunk_bytes: int | None = None,
 ) -> None:
     """
     Pack the state dictionary or model to a flashpack file.
@@ -68,13 +98,16 @@ def pack_to_file(
     macroblocks only (see ``constants.py``); every other dtype is stored
     uncompressed, and the file falls back to the plain uncompressed format
     when no bf16 macroblock is present. Requires the optional ``zstandard``
-    package.
+    package. ``hi_chunk_bytes`` overrides the v2 high-plane chunk size (default
+    ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES``, or ``FLASHPACK_FPZ_CHUNK_BYTES``);
+    larger chunks mean fewer per-chunk wrapper objects for the GPU decoder.
     """
     if compress is not None and compress != FPZ_COMPRESS_BF16:
         raise ValueError(
             f"Unsupported compress option: {compress!r} "
             f"(expected None or {FPZ_COMPRESS_BF16!r})"
         )
+    resolved_hi_chunk_bytes = _resolve_hi_chunk_bytes(hi_chunk_bytes)
 
     if isinstance(state_dict_or_model, torch.nn.Module):
         state_dict = state_dict_or_model.state_dict()
@@ -202,6 +235,7 @@ def pack_to_file(
                 destination_path=destination_path,
                 dest_dir=dest_dir,
                 silent=silent,
+                hi_chunk_bytes=resolved_hi_chunk_bytes,
             )
         return
 
@@ -478,24 +512,25 @@ _DEFAULT_FPZ_VERSION = 2
 
 
 def _fpz_encode_frame_v2(
-    f, block_start: int, frame_u8: np.ndarray, chunk_compressor
+    f, block_start: int, frame_u8: np.ndarray, chunk_compressor, chunk: int
 ) -> dict:
     """Encode one split-plane frame with a CHUNKED high plane (codec v2).
 
     Same low/high split as v1, but the high plane is compressed as a sequence of
-    independent zstd frames of ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` uncompressed
-    bytes each (the frame's last chunk holds the remainder). Many small chunks
-    are what a GPU decoder needs to decompress in parallel; the frame record
-    lists each chunk's compressed length so the reader locates them by prefix
-    sum. Ratio drops slightly versus v1 because each chunk compresses without
-    the neighbouring chunks' context.
+    independent zstd frames of ``chunk`` uncompressed bytes each (the frame's
+    last chunk holds the remainder). Many small chunks are what a GPU decoder
+    needs to decompress in parallel; the frame record lists each chunk's
+    compressed length so the reader locates them by prefix sum. Larger chunks
+    mean fewer per-chunk wrapper objects for the GPU decoder to build (the read
+    bottleneck once decode is parallel) at the cost of slightly less parallelism
+    and a hair less ratio. Ratio drops slightly versus v1 because each chunk
+    compresses without the neighbouring chunks' context.
     """
     n_out = int(frame_u8.shape[0])
     lo = np.ascontiguousarray(frame_u8[0::2])
     hi = np.ascontiguousarray(frame_u8[1::2])
     lo_bytes = lo.tobytes()
     half = int(hi.shape[0])
-    chunk = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
     hi_z_chunks = [
         chunk_compressor.compress(hi[off : off + chunk].tobytes())
         for off in range(0, half, chunk)
@@ -575,6 +610,7 @@ def _write_fpz_pack_streaming(
     destination_path: str,
     dest_dir: str,
     silent: bool,
+    hi_chunk_bytes: int,
 ) -> None:
     """Write a compressed (fpz) pack to ``destination_path`` atomically in a
     single pass -- no uncompressed scratch file.
@@ -583,21 +619,24 @@ def _write_fpz_pack_streaming(
     dtype conversion and inter-tensor alignment as the uncompressed planner)
     and either streamed through split-plane zstd frames (bf16 blocks, per
     ``compress_flags``) or written verbatim. The footer/frame format is
-    byte-compatible with the read path.
+    byte-compatible with the read path. ``hi_chunk_bytes`` is the v2 high-plane
+    chunk size, recorded per fpz block so the reader reproduces the chunking.
     """
     zstandard = require_zstandard()
     version = _DEFAULT_FPZ_VERSION
     if version == 2:
-        # v2 compresses each 64 KiB high-plane chunk as its own zstd frame.
-        # threads=-1 (one worker per core) does nothing for a 64 KiB input and
-        # only adds per-call overhead, so use a single-threaded compressor;
-        # parallelism at repack time now comes from the many chunks, not from
-        # one big multithreaded compress. (Chunks are compressed serially here;
-        # a chunk-level thread pool is a repack-speed follow-up if needed.)
+        # v2 compresses each high-plane chunk (hi_chunk_bytes uncompressed) as
+        # its own zstd frame. threads=-1 (one worker per core) does nothing for
+        # a small input and only adds per-call overhead, so use a single-threaded
+        # compressor; parallelism at repack time now comes from the many chunks,
+        # not from one big multithreaded compress. (Chunks are compressed
+        # serially here; a chunk-level thread pool is a repack-speed follow-up.)
         chunk_compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL)
 
         def encode_frame(f_, block_start_, frame_u8_):
-            return _fpz_encode_frame_v2(f_, block_start_, frame_u8_, chunk_compressor)
+            return _fpz_encode_frame_v2(
+                f_, block_start_, frame_u8_, chunk_compressor, hi_chunk_bytes
+            )
 
         codec_name = FPZ_CODEC_SPLITPLANE_V2
     else:
@@ -640,10 +679,12 @@ def _write_fpz_pack_streaming(
                         f, block_offset, block, state_dict, encode_frame, progress
                     )
                     record["length_bytes"] = int(f.tell() - block_offset)
-                    record["fpz"] = {
-                        "codec": codec_name,
-                        "frames": frames,
-                    }
+                    fpz_record: dict = {"codec": codec_name, "frames": frames}
+                    if version == 2:
+                        # Record the chunk size so the reader reproduces the
+                        # chunking regardless of the current default.
+                        fpz_record["hi_chunk_usize"] = int(hi_chunk_bytes)
+                    record["fpz"] = fpz_record
                 else:
                     for kind, data in _iter_block_uncompressed_chunks(
                         block, state_dict, progress
