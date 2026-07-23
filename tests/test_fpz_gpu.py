@@ -14,6 +14,7 @@ import torch
 from flashpack import deserialization
 from flashpack.deserialization import (
     _env_flag,
+    _fpz_batch_signature,
     _fpz_gpu_decode_enabled,
     _load_nvcomp,
     iterate_from_flash_tensor,
@@ -89,6 +90,30 @@ def test_plan_rejects_nonpositive_byte_budget(bad: int) -> None:
         plan_fpz_gpu_batches(
             [_frame_task(0, 1)], max_batch_frames=1, max_batch_bytes=bad
         )
+
+
+# --------------------------------------------------------------------------
+# _fpz_batch_signature -- pure config-cache key
+# --------------------------------------------------------------------------
+
+
+def test_signature_is_per_frame_half_sizes() -> None:
+    batch = [_frame_task(0, 100), _frame_task(0, 40)]
+    assert _fpz_batch_signature(batch) == (50, 20)
+
+
+def test_signature_matches_for_same_shape_batches() -> None:
+    # Two batches of identical full-frame shapes hash to the same key -> they
+    # share one cached DecompressConfig (the whole point of the cache).
+    a = [_frame_task(0, 128), _frame_task(0, 128)]
+    b = [_frame_task(1, 128), _frame_task(2, 128)]
+    assert _fpz_batch_signature(a) == _fpz_batch_signature(b) == (64, 64)
+
+
+def test_signature_differs_when_a_tail_frame_changes_shape() -> None:
+    full = [_frame_task(0, 128), _frame_task(0, 128)]
+    with_tail = [_frame_task(0, 128), _frame_task(0, 40)]
+    assert _fpz_batch_signature(full) != _fpz_batch_signature(with_tail)
 
 
 # --------------------------------------------------------------------------
