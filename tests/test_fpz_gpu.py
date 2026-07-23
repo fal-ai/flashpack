@@ -14,6 +14,7 @@ import torch
 from flashpack import deserialization
 from flashpack.deserialization import (
     _env_flag,
+    _env_flag_default,
     _fpz_batch_signature,
     _fpz_gpu_decode_enabled,
     _load_nvcomp,
@@ -138,6 +139,77 @@ def test_env_flag_falsy(monkeypatch, value: str) -> None:
 def test_env_flag_unset_is_false(monkeypatch) -> None:
     monkeypatch.delenv("FLASHPACK_FPZ_GPU_DECODE", raising=False)
     assert _fpz_gpu_decode_enabled() is False
+
+
+def test_env_flag_default_respects_default_when_unset(monkeypatch) -> None:
+    monkeypatch.delenv("FLASHPACK_FPZ_GPU_TORCH_ALLOC", raising=False)
+    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", True) is True
+    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", False) is False
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("0", False), ("false", False), ("1", True), ("on", True)]
+)
+def test_env_flag_default_env_overrides(monkeypatch, value, expected) -> None:
+    monkeypatch.setenv("FLASHPACK_FPZ_GPU_TORCH_ALLOC", value)
+    # Env always wins over the default, in both directions.
+    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", True) is expected
+    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", False) is expected
+
+
+# --------------------------------------------------------------------------
+# torch caching allocator wiring into nvcomp (guarded, idempotent)
+# --------------------------------------------------------------------------
+
+
+class _FakeNvcompAllocOK:
+    def __init__(self) -> None:
+        self.installed = None
+
+    def set_device_allocator(self, allocator) -> None:
+        self.installed = allocator
+
+
+class _FakeNvcompAllocRaises:
+    def set_device_allocator(self, allocator) -> None:
+        raise RuntimeError("no allocator hook here")
+
+
+def _reset_alloc_latches(monkeypatch) -> None:
+    monkeypatch.setattr(deserialization, "_FPZ_NVCOMP_ALLOC_INSTALLED", False)
+    monkeypatch.setattr(deserialization, "_FPZ_NVCOMP_ALLOC_WARNED", False)
+
+
+def test_install_allocator_success_registers_a_callable(monkeypatch) -> None:
+    _reset_alloc_latches(monkeypatch)
+    fake = _FakeNvcompAllocOK()
+    ok = deserialization._install_torch_nvcomp_allocator(fake, torch.device("cuda:0"))
+    assert ok is True
+    assert callable(fake.installed)
+
+
+def test_install_allocator_is_idempotent(monkeypatch) -> None:
+    _reset_alloc_latches(monkeypatch)
+    first = _FakeNvcompAllocOK()
+    assert deserialization._install_torch_nvcomp_allocator(
+        first, torch.device("cuda:0")
+    )
+    # Already installed globally: a second call is a no-op and does not
+    # re-register on another (fake) module.
+    second = _FakeNvcompAllocOK()
+    assert deserialization._install_torch_nvcomp_allocator(
+        second, torch.device("cuda:0")
+    )
+    assert second.installed is None
+
+
+def test_install_allocator_failure_is_guarded_and_warns(monkeypatch) -> None:
+    _reset_alloc_latches(monkeypatch)
+    with pytest.warns(RuntimeWarning, match="set_device_allocator"):
+        ok = deserialization._install_torch_nvcomp_allocator(
+            _FakeNvcompAllocRaises(), torch.device("cuda:0")
+        )
+    assert ok is False
 
 
 # --------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import math
 import os
 import queue
 import threading
+import time
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -691,6 +692,14 @@ def _fpz_read_into_cuda_storage(
 #     directly (no copy). nvcomp.from_dlpack(...) is the explicit-DLPack
 #     equivalent; as_array is sufficient here.
 #
+#   nvcomp.set_device_allocator(allocator) -- "Sets a new allocator ... for
+#     future device allocations." allocator is
+#     ``allocator(nbytes: int, stream: nvcomp.Stream) -> obj`` where obj has an
+#     integer ``.ptr`` and frees on garbage collection. nvcomp grabs scratch
+#     from this for every decode; its default (cudaMalloc/cudaFree) syncs the
+#     device per call, so we install a torch-caching-allocator adapter (see
+#     _install_torch_nvcomp_allocator) to serve scratch pool-side with no sync.
+#
 # Compatibility, verified locally against the pack side (python-zstandard
 # level-3, threads=-1, one-shot ``compress``): every high plane is a SINGLE
 # standard zstd frame (magic 0xFD2FB528) with the content size embedded, a
@@ -737,6 +746,92 @@ def _load_nvcomp():
                 stacklevel=2,
             )
         return None
+
+
+def _env_flag_default(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# nvcomp calls its device allocator once per decode for scratch. Its default
+# allocator is cudaMalloc/cudaFree, and each of those synchronizes the device --
+# on the H200 that per-call sync (not the config sync) was the dominant fpz cost
+# (~60ms/frame, tier-flat). Routing nvcomp's scratch through torch's stream-aware
+# caching allocator serves it from an existing pool with no cudaMalloc/sync.
+_fpz_nvcomp_alloc_tls = threading.local()
+_FPZ_NVCOMP_ALLOC_INSTALLED = False
+_FPZ_NVCOMP_ALLOC_WARNED = False
+
+
+class _TorchNvcompDeviceBuffer:
+    """Adapter exposing a torch caching-allocator block to nvcomp's allocator
+    protocol: an object with an integer ``ptr`` that frees on ``__del__``.
+
+    The allocation is tied to the calling reader thread's CUDA stream (stashed
+    in a thread-local by the reader) so torch's caching allocator won't hand the
+    block to another stream while nvcomp's decode -- which runs on that same
+    stream -- is still using it.
+    """
+
+    __slots__ = ("_ptr",)
+
+    def __init__(self, nbytes: int, device_index: int, stream) -> None:
+        self._ptr = torch.cuda.caching_allocator_alloc(nbytes, device_index, stream)
+
+    @property
+    def ptr(self) -> int:
+        return self._ptr
+
+    def __del__(self) -> None:
+        try:
+            torch.cuda.caching_allocator_delete(self._ptr)
+        except Exception:
+            pass
+
+
+def _install_torch_nvcomp_allocator(nvcomp, device: torch.device) -> bool:
+    """Route nvcomp's per-decode device scratch through torch's caching allocator.
+
+    Global and idempotent. Guarded: any API mismatch or failure leaves nvcomp on
+    its default allocator (decode still works, just slower) and warns once.
+
+    nvcomp API (from the wheel's ``set_device_allocator`` docstring): the
+    allocator is ``allocator(nbytes: int, stream: nvcomp.Stream) -> obj`` where
+    ``obj`` has an integer ``.ptr`` and releases its memory when garbage
+    collected. We ignore nvcomp's ``stream`` arg and instead read the reader
+    thread's torch stream from ``_fpz_nvcomp_alloc_tls`` (set per thread), which
+    is the stream nvcomp actually decodes on.
+    """
+    global _FPZ_NVCOMP_ALLOC_INSTALLED, _FPZ_NVCOMP_ALLOC_WARNED
+    if _FPZ_NVCOMP_ALLOC_INSTALLED:
+        return True
+    dev_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+
+    def _alloc(nbytes, stream=None):
+        return _TorchNvcompDeviceBuffer(
+            int(nbytes), dev_index, getattr(_fpz_nvcomp_alloc_tls, "stream", None)
+        )
+
+    try:
+        nvcomp.set_device_allocator(_alloc)
+    except Exception:
+        if not _FPZ_NVCOMP_ALLOC_WARNED:
+            _FPZ_NVCOMP_ALLOC_WARNED = True
+            warnings.warn(
+                "Could not install the torch caching allocator into nvcomp "
+                "(set_device_allocator failed); nvcomp keeps its default "
+                "cudaMalloc allocator. Set FLASHPACK_FPZ_GPU_TORCH_ALLOC=0 to "
+                "silence.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return False
+    _FPZ_NVCOMP_ALLOC_INSTALLED = True
+    return True
 
 
 # GPU-decode tuning knobs (env-overridable). Each staging *slot* holds, for a
@@ -888,12 +983,25 @@ def _fpz_read_into_cuda_storage_gpu(
         work.put(None)
 
     errors: list[BaseException] = []
+    trace_on = _env_flag("FLASHPACK_FPZ_GPU_TRACE")
+    traces: list[str] = []
+    traces_lock = threading.Lock()
 
-    def _reader() -> None:
+    # Route nvcomp's per-decode scratch through torch's caching allocator to kill
+    # the per-call cudaMalloc/cudaFree device sync (the round-2 bottleneck).
+    # Global + idempotent + guarded; disable with FLASHPACK_FPZ_GPU_TORCH_ALLOC=0.
+    if _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", True):
+        _install_torch_nvcomp_allocator(nvcomp, device)
+
+    def _reader(thread_idx: int) -> None:
         try:
             fd = os.open(path, os.O_RDONLY)
             stream = torch.cuda.Stream(device=device)
             stream.wait_event(alloc_ready)
+            # nvcomp's device allocator (if installed) reads this thread's stream
+            # from the thread-local, so decode scratch is tied to the decode
+            # stream and torch won't reuse it out from under an in-flight decode.
+            _fpz_nvcomp_alloc_tls.stream = stream
             # Resolve the concrete ordinal in this thread: an indexless "cuda"
             # device places both the stream and the staging tensors on this
             # thread's current device, and the Codec must match or nvcomp raises
@@ -934,6 +1042,20 @@ def _fpz_read_into_cuda_storage_gpu(
                 torch.empty(batch_frames * half_cap, dtype=torch.uint8, device=device)
                 for _ in range(n_slots)
             ]
+            # Hoist the decode out= wrappers: one nvcomp.Array per (slot, frame)
+            # over the full half_cap slice, built ONCE. decode writes the true
+            # (config-driven) size <= half_cap into it, so the same wrappers serve
+            # every batch regardless of shape -- no per-batch out construction.
+            # (The compressed-in src wrappers stay per-batch, sized to the exact
+            # hi_len, so nvcomp never sees trailing bytes past the single zstd
+            # frame.)
+            out_wrap = [
+                [
+                    nvcomp.as_array(hi_dev[s].narrow(0, k * half_cap, half_cap))
+                    for k in range(batch_frames)
+                ]
+                for s in range(n_slots)
+            ]
             # Recorded now so the first synchronize on any slot is a no-op.
             events = [torch.cuda.Event() for _ in range(n_slots)]
             for ev in events:
@@ -941,6 +1063,8 @@ def _fpz_read_into_cuda_storage_gpu(
             # Per-thread cache: batch shape signature -> reusable DecompressConfig.
             configs: dict[tuple[int, ...], object] = {}
             batch_idx = 0
+            t_pread = t_h2d = t_decode = t_interleave = t_evsync = t_final = 0.0
+            n_batches = n_frames_done = n_cfg = 0
             try:
                 while True:
                     item = work.get()
@@ -964,7 +1088,10 @@ def _fpz_read_into_cuda_storage_gpu(
                     # Wait for this slot's previous batch (its interleave) before
                     # overwriting its pinned/device buffers -- decode no longer
                     # synchronizes, so this event is what keeps reuse safe.
+                    _t = time.perf_counter() if trace_on else 0.0
                     events[slot].synchronize()
+                    if trace_on:
+                        t_evsync += time.perf_counter() - _t
 
                     halves: list[int] = []
                     hi_lens: list[int] = []
@@ -987,6 +1114,7 @@ def _fpz_read_into_cuda_storage_gpu(
                         base = specs[blk].offset_bytes + payload_off
                         lo_off = k * half_cap
                         hiz_off = k * comp_cap
+                        _t = time.perf_counter() if trace_on else 0.0
                         _pread_into(
                             fd, base, lo_pin_view[slot][lo_off : lo_off + lo_len]
                         )
@@ -995,8 +1123,11 @@ def _fpz_read_into_cuda_storage_gpu(
                             base + lo_len,
                             hiz_pin_view[slot][hiz_off : hiz_off + hi_len],
                         )
+                        if trace_on:
+                            t_pread += time.perf_counter() - _t
                         halves.append(half)
                         hi_lens.append(hi_len)
+                        _t = time.perf_counter() if trace_on else 0.0
                         with torch.cuda.stream(stream):
                             lo_dev[slot].narrow(0, lo_off, half).copy_(
                                 lo_pin[slot].narrow(0, lo_off, half), non_blocking=True
@@ -1005,6 +1136,8 @@ def _fpz_read_into_cuda_storage_gpu(
                                 hiz_pin[slot].narrow(0, hiz_off, hi_len),
                                 non_blocking=True,
                             )
+                        if trace_on:
+                            t_h2d += time.perf_counter() - _t
 
                     srcs = [
                         nvcomp.as_array(
@@ -1012,22 +1145,24 @@ def _fpz_read_into_cuda_storage_gpu(
                         )
                         for k in range(len(batch))
                     ]
-                    outs = [
-                        nvcomp.as_array(hi_dev[slot].narrow(0, k * half_cap, halves[k]))
-                        for k in range(len(batch))
-                    ]
+                    outs = out_wrap[slot][: len(batch)]
                     # Reusable config per batch shape: build once (one sync, waits
                     # on the H2D above), then decode sync-free here and on every
                     # later batch that shares the shape.
                     sig = _fpz_batch_signature(batch)
+                    _t = time.perf_counter() if trace_on else 0.0
                     cfg = configs.get(sig)
                     if cfg is None:
                         cfg = codec.decompression_config(srcs)
                         configs[sig] = cfg
+                        n_cfg += 1
                     codec.decode(srcs, out=outs, decompression_config=cfg)
+                    if trace_on:
+                        t_decode += time.perf_counter() - _t
 
                     # Strided interleave per frame (same invariant as the CPU
                     # path): even bytes low plane, odd bytes high plane.
+                    _t = time.perf_counter() if trace_on else 0.0
                     for k, (_, blk, frame, out_pos) in enumerate(batch):
                         half = halves[k]
                         n_out = int(frame["n_out"])
@@ -1042,18 +1177,46 @@ def _fpz_read_into_cuda_storage_gpu(
                                 non_blocking=True,
                             )
                     events[slot].record(stream)
+                    if trace_on:
+                        t_interleave += time.perf_counter() - _t
+                        n_batches += 1
+                        n_frames_done += len(batch)
             finally:
                 os.close(fd)
+            _t = time.perf_counter() if trace_on else 0.0
             stream.synchronize()
+            _fpz_nvcomp_alloc_tls.stream = None
+            if trace_on:
+                t_final += time.perf_counter() - _t
+                # Enqueue phases (h2d, interleave) are async so their wall is
+                # small; a large `decode` wall means the decode CALL itself
+                # blocks (internal sync / scratch alloc), while a large
+                # `evsync`/`final` means the pipeline is GPU-bound waiting on
+                # decode+interleave to finish.
+                line = (
+                    f"[fpz-gpu-trace] thread={thread_idx} frames={n_frames_done} "
+                    f"batches={n_batches} cfg_builds={n_cfg} "
+                    f"pread={t_pread:.3f}s h2d_enq={t_h2d:.3f}s "
+                    f"decode={t_decode:.3f}s interleave_enq={t_interleave:.3f}s "
+                    f"evsync={t_evsync:.3f}s final_sync={t_final:.3f}s"
+                )
+                with traces_lock:
+                    traces.append(line)
         except BaseException as e:
             errors.append(e)
 
-    threads = [threading.Thread(target=_reader, daemon=True) for _ in range(n_threads)]
+    threads = [
+        threading.Thread(target=_reader, args=(i,), daemon=True)
+        for i in range(n_threads)
+    ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     torch.cuda.synchronize(device)
+    if trace_on:
+        for line in traces:
+            print(line)
     if errors:
         raise errors[0]
 
