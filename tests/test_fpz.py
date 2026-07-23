@@ -10,6 +10,7 @@ is not run in CI).
 
 import os
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -364,3 +365,50 @@ def test_streaming_gap_straddling_frame_boundary(tmp_path, monkeypatch) -> None:
             _raw_bytes(plain_tensors[name]), _raw_bytes(comp_tensors[name])
         )
         assert torch.equal(_raw_bytes(comp_tensors[name]), _raw_bytes(source[name]))
+
+
+@pytest.mark.skipif(
+    (os.cpu_count() or 1) < 4, reason="thread-scaling proof needs >=4 CPUs"
+)
+def test_cpu_decode_scales_with_threads(tmp_path, monkeypatch) -> None:
+    # Regression guard for the serialized CPU decode: the fpz read path must
+    # parallelize across FLASHPACK_READ_THREADS. zstd decompress releases the
+    # GIL, so 8 threads must materially beat 1. Generous bound (<=0.6x wall)
+    # with best-of-3 timing so CI jitter can't flake it.
+    import flashpack.serialization as serialization
+
+    monkeypatch.setattr(
+        serialization, "FPZ_FRAME_UNCOMPRESSED_BYTES", 1 << 20, raising=True
+    )
+    # ~64 MB uncompressed, many frames; entropy high enough that decode (not
+    # I/O from the warm page cache) dominates the wall.
+    data = (torch.randn(32 * 1024 * 1024) * 0.05).to(torch.bfloat16)
+    comp = str(tmp_path / "comp.flashpack")
+    pack_to_file({"w": data}, comp, target_dtype=None, compress="fpz-bf16")
+
+    frames = get_flashpack_file_metadata(comp)["macroblocks"][0]["fpz"]["frames"]
+    assert len(frames) >= 16  # enough work to spread over 8 threads
+
+    def best_wall(threads: int, reps: int = 3) -> float:
+        monkeypatch.setenv("FLASHPACK_READ_THREADS", str(threads))
+        best = float("inf")
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            read_flashpack_file(comp, device="cpu")
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    read_flashpack_file(comp, device="cpu")  # warm the page cache
+    single = best_wall(1)
+    multi = best_wall(8)
+
+    # Sanity: decode is still correct under many threads.
+    monkeypatch.setenv("FLASHPACK_READ_THREADS", "8")
+    storage, meta = read_flashpack_file(comp, device="cpu")
+    (w,) = [t for _, t in iterate_from_flash_tensor(storage, meta)]
+    assert torch.equal(_uint16_view(w), _uint16_view(data))
+
+    assert multi <= 0.6 * single, (
+        f"fpz CPU decode did not scale: 1-thread={single * 1e3:.1f} ms, "
+        f"8-thread={multi * 1e3:.1f} ms (expected 8-thread <= 0.6x)"
+    )

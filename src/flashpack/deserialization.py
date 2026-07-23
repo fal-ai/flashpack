@@ -334,6 +334,13 @@ def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
         dist.broadcast(block, src=src)
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 def _pread_into(fd: int, offset: int, mv: memoryview) -> None:
     """Fill ``mv`` from ``fd`` at ``offset`` with ``preadv`` (reused reader
     machinery). Raises ``IOError`` on a short read (e.g. a truncated file)."""
@@ -346,17 +353,44 @@ def _pread_into(fd: int, offset: int, mv: memoryview) -> None:
         got += r
 
 
+def _fpz_frame_tasks(specs: list[MacroblockSpec]) -> list[tuple]:
+    """Build the per-block decode work list and validate frame coverage.
+
+    Each item is ``("frame", block_idx, frame, out_pos)`` for an fpz frame or
+    ``("raw", block_idx, None, 0)`` for a plain block. Raises ``ValueError`` if
+    a block's frames do not exactly cover its uncompressed byte length -- the
+    same error surface the single-threaded decoder used to raise.
+    """
+    tasks: list[tuple] = []
+    for idx, spec in enumerate(specs):
+        if spec.fpz is None:
+            tasks.append(("raw", idx, None, 0))
+            continue
+        total = spec.uncompressed_bytes
+        out_pos = 0
+        for frame in spec.fpz["frames"]:
+            n_out = int(frame["n_out"])
+            if out_pos + n_out > total:
+                raise ValueError("fpz frames exceed the macroblock size")
+            tasks.append(("frame", idx, frame, out_pos))
+            out_pos += n_out
+        if out_pos != total:
+            raise ValueError(f"fpz frames cover {out_pos} bytes, expected {total}")
+    return tasks
+
+
 def _fpz_read_frame_planes(
     fd: int, block_file_offset: int, frame: dict[str, Any], decompressor
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read one fpz frame and return its ``(lo, hi)`` byte planes as uint8
     numpy arrays, each ``n_out // 2`` bytes.
 
-    This is the shared decode step for both the CPU and CUDA read paths: it
-    performs the file read (``preadv``) and the CPU zstd decode of the high
-    plane. A future GPU decoder (nvcomp) can replace only the decompress call
-    behind this same frame interface. The CPU path interleaves the planes with
-    numpy; the CUDA path H2D-copies them and interleaves with strided copies.
+    Shared decode step for the CPU and CUDA read paths: the ``preadv`` read and
+    the zstd decode of the high plane. zstd ``decompress`` releases the GIL and
+    accepts the compressed input as a buffer, so the read target is passed as a
+    ``memoryview`` (no intermediate ``bytes`` copy) and N threads scale near
+    linearly. A future GPU decoder (nvcomp) can replace only the decompress
+    call behind this same frame interface.
     """
     payload_off = int(frame["payload_off"])
     lo_len = int(frame["lo_len"])
@@ -369,7 +403,9 @@ def _fpz_read_frame_planes(
     hi_raw = bytearray(hi_len)
     _pread_into(fd, block_file_offset + payload_off + lo_len, memoryview(hi_raw))
 
-    hi_bytes = decompressor.decompress(bytes(hi_raw), max_output_size=half)
+    # memoryview input avoids a GIL-held full copy of the compressed plane;
+    # decompress itself releases the GIL.
+    hi_bytes = decompressor.decompress(memoryview(hi_raw), max_output_size=half)
     lo = np.frombuffer(lo_raw, dtype=np.uint8)
     hi = np.frombuffer(hi_bytes, dtype=np.uint8)
     if lo_len * 2 != n_out or lo.shape[0] != lo_len or hi.shape[0] != half:
@@ -377,46 +413,74 @@ def _fpz_read_frame_planes(
     return lo, hi
 
 
-def _fpz_decode_block_into_cpu(
-    fd: int, spec: MacroblockSpec, dst_u8: np.ndarray, decompressor
-) -> None:
-    """Decode every frame of an fpz block into ``dst_u8`` (uint8 view of the
-    uncompressed destination block). Interleaves the low/high planes so the
-    reconstructed bytes are identical to the uncompressed pack:
-    ``dst[0::2] = lo`` (low byte) and ``dst[1::2] = hi`` (high byte)."""
-    assert spec.fpz is not None
-    total = int(dst_u8.shape[0])
-    out_pos = 0
-    for frame in spec.fpz["frames"]:
-        lo, hi = _fpz_read_frame_planes(fd, spec.offset_bytes, frame, decompressor)
-        n_out = int(frame["n_out"])
-        if out_pos + n_out > total:
-            raise ValueError("fpz frames exceed the macroblock size")
-        seg = dst_u8[out_pos : out_pos + n_out]
-        seg[0::2] = lo
-        seg[1::2] = hi
-        out_pos += n_out
-    if out_pos != total:
-        raise ValueError(f"fpz frames cover {out_pos} bytes, expected {total}")
-
-
 def _fpz_read_into_cpu_storage(
     path: str, specs: list[MacroblockSpec], blocks: list[torch.Tensor]
 ) -> None:
-    """Fill pre-allocated (uncompressed-sized) CPU ``blocks`` from an fpz file.
-    fpz blocks are decoded frame-by-frame; plain blocks are read verbatim."""
+    """Fill pre-allocated (uncompressed-sized) CPU ``blocks`` from an fpz file
+    with a pool of decode threads.
+
+    Work is one item per fpz frame (or per plain block); frames write disjoint
+    destination byte ranges, so threads never collide. Each thread owns a file
+    descriptor and a zstd decompressor. The heavy step -- the zstd decode --
+    releases the GIL, so throughput scales with ``FLASHPACK_READ_THREADS``
+    (default 16) instead of running serially as it did before.
+    """
     zstandard = require_zstandard()
-    decompressor = zstandard.ZstdDecompressor()
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        for spec, block in zip(specs, blocks):
-            dst_u8 = block.view(torch.uint8).numpy()
-            if spec.fpz is None:
-                _pread_into(fd, spec.offset_bytes, memoryview(dst_u8))
-            else:
-                _fpz_decode_block_into_cpu(fd, spec, dst_u8, decompressor)
-    finally:
-        os.close(fd)
+    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+
+    dst_u8 = [b.view(torch.uint8).numpy() for b in blocks]
+    tasks = _fpz_frame_tasks(specs)
+    n_threads = min(n_threads, max(1, len(tasks)))
+
+    work: queue.SimpleQueue = queue.SimpleQueue()
+    for task in tasks:
+        work.put(task)
+    for _ in range(n_threads):
+        work.put(None)
+
+    errors: list[BaseException] = []
+
+    def _reader() -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            decompressor = zstandard.ZstdDecompressor()
+            try:
+                while True:
+                    item = work.get()
+                    if item is None:
+                        break
+                    kind, blk, frame, out_pos = item
+                    if kind == "raw":
+                        spec = specs[blk]
+                        _pread_into(
+                            fd, spec.offset_bytes, memoryview(dst_u8[blk])
+                        )
+                        continue
+                    spec = specs[blk]
+                    lo, hi = _fpz_read_frame_planes(
+                        fd, spec.offset_bytes, frame, decompressor
+                    )
+                    n_out = int(frame["n_out"])
+                    seg = dst_u8[blk][out_pos : out_pos + n_out]
+                    # Disjoint destination ranges across threads; numpy releases
+                    # the GIL for the strided byte copy.
+                    seg[0::2] = lo
+                    seg[1::2] = hi
+            finally:
+                os.close(fd)
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=_reader, daemon=True) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
+_FPZ_CUDA_BUFFERS_PER_THREAD = 2
 
 
 def _fpz_read_into_cuda_storage(
@@ -428,28 +492,28 @@ def _fpz_read_into_cuda_storage(
     """Fill pre-allocated device ``blocks`` from an fpz file with a pool of
     reader threads (mirrors ``parallel_read_into_storage``).
 
-    Each reader owns a file descriptor, a CUDA stream, and reusable pinned/
-    device staging buffers. A work item is one fpz frame (or a whole plain
-    block); frames write disjoint destination segments so the readers never
-    collide. Per frame: read + CPU zstd-decode the planes (the shared
-    ``_fpz_read_frame_planes``; zstd releases the GIL), H2D the contiguous low
-    and decompressed-high planes, then two strided copies on the GPU
-    (``dst_u8[0::2] = lo``, ``dst_u8[1::2] = hi``). A GPU decoder (nvcomp) would
-    slot in by replacing the decompress inside ``_fpz_read_frame_planes``.
+    Each reader owns a file descriptor, a CUDA stream, and a small ring of
+    double-buffered pinned/device staging slots. A work item is one fpz frame
+    (or a whole plain block); frames write disjoint destination segments so the
+    readers never collide. Per frame: ``preadv`` the low plane straight into a
+    pinned buffer, zstd-decode the high plane (GIL released) and copy it into a
+    pinned buffer, then enqueue on the stream the two H2Ds and the two strided
+    GPU copies (``dst_u8[0::2] = lo``, ``dst_u8[1::2] = hi``). A GPU decoder
+    (nvcomp) would slot in by replacing the decompress step.
 
-    GPU-untested locally (no CUDA device); the frame read, decode, and plane
-    interleave are exercised by the CPU tests via the shared helpers above.
+    There is NO per-frame ``stream.synchronize()``: a CUDA event per staging
+    slot gates only buffer reuse, so a thread reads/decodes the next frame while
+    the GPU is still consuming the previous one. Removing that per-frame sync
+    (and the single-buffered staging) is the fix for the observed ~2.6 GB/s
+    stall -- the CPU decode now overlaps the H2D/copy instead of blocking on it.
+
+    GPU-untested locally (no CUDA device); the frame read + decode is exercised
+    by the CPU tests via the shared ``_fpz_read_frame_planes`` helper.
     """
     zstandard = require_zstandard()
-
-    def _env_int(name: str, default: int) -> int:
-        try:
-            return int(os.environ.get(name, default))
-        except ValueError:
-            return default
-
     n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
     half_cap = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
+    n_slots = _FPZ_CUDA_BUFFERS_PER_THREAD
 
     byte_blocks = [b.view(torch.uint8) for b in blocks]
 
@@ -458,20 +522,11 @@ def _fpz_read_into_cuda_storage(
     alloc_ready = torch.cuda.Event()
     alloc_ready.record(torch.cuda.current_stream(device))
 
-    # Work items: ("frame", block_idx, frame, out_pos) or ("raw", block_idx, None, 0).
+    tasks = _fpz_frame_tasks(specs)
     work: queue.SimpleQueue = queue.SimpleQueue()
-    n_tasks = 0
-    for idx, spec in enumerate(specs):
-        if spec.fpz is None:
-            work.put(("raw", idx, None, 0))
-            n_tasks += 1
-        else:
-            out_pos = 0
-            for frame in spec.fpz["frames"]:
-                work.put(("frame", idx, frame, out_pos))
-                out_pos += int(frame["n_out"])
-                n_tasks += 1
-    n_threads = min(n_threads, max(1, n_tasks))
+    for task in tasks:
+        work.put(task)
+    n_threads = min(n_threads, max(1, len(tasks)))
     for _ in range(n_threads):
         work.put(None)
 
@@ -483,10 +538,27 @@ def _fpz_read_into_cuda_storage(
             decompressor = zstandard.ZstdDecompressor()
             stream = torch.cuda.Stream(device=device)
             stream.wait_event(alloc_ready)
-            lo_pin = torch.empty(half_cap, dtype=torch.uint8, pin_memory=True)
-            hi_pin = torch.empty(half_cap, dtype=torch.uint8, pin_memory=True)
-            lo_dev = torch.empty(half_cap, dtype=torch.uint8, device=device)
-            hi_dev = torch.empty(half_cap, dtype=torch.uint8, device=device)
+            lo_pin = [
+                torch.empty(half_cap, dtype=torch.uint8, pin_memory=True)
+                for _ in range(n_slots)
+            ]
+            hi_pin = [
+                torch.empty(half_cap, dtype=torch.uint8, pin_memory=True)
+                for _ in range(n_slots)
+            ]
+            lo_dev = [
+                torch.empty(half_cap, dtype=torch.uint8, device=device)
+                for _ in range(n_slots)
+            ]
+            hi_dev = [
+                torch.empty(half_cap, dtype=torch.uint8, device=device)
+                for _ in range(n_slots)
+            ]
+            lo_view = [memoryview(b.numpy()) for b in lo_pin]
+            events = [torch.cuda.Event() for _ in range(n_slots)]
+            for ev in events:
+                ev.record(stream)
+            i = 0
             try:
                 while True:
                     item = work.get()
@@ -499,24 +571,46 @@ def _fpz_read_into_cuda_storage(
                         buf = bytearray(spec.length_bytes)
                         _pread_into(fd, spec.offset_bytes, memoryview(buf))
                         host = torch.frombuffer(buf, dtype=torch.uint8)
+                        stream.synchronize()
                         with torch.cuda.stream(stream):
                             dst.copy_(host, non_blocking=False)
                         continue
-                    spec = specs[blk]
-                    lo, hi = _fpz_read_frame_planes(
-                        fd, spec.offset_bytes, frame, decompressor
-                    )
+
+                    slot = i % n_slots
+                    i += 1
+                    # The slot's previous H2D must be done before we overwrite
+                    # its pinned buffers.
+                    events[slot].synchronize()
+
+                    payload_off = int(frame["payload_off"])
+                    lo_len = int(frame["lo_len"])
+                    hi_len = int(frame["hi_len"])
                     n_out = int(frame["n_out"])
-                    half = lo.shape[0]
-                    lo_pin[:half].copy_(torch.from_numpy(lo))
-                    hi_pin[:half].copy_(torch.from_numpy(hi))
+                    half = n_out - lo_len
+                    base = specs[blk].offset_bytes + payload_off
+
+                    # Low plane: preadv straight into the pinned buffer (no
+                    # intermediate numpy/bytearray copy).
+                    _pread_into(fd, base, lo_view[slot][:lo_len])
+                    # High plane: decode (GIL released), then one copy into pin.
+                    hi_raw = bytearray(hi_len)
+                    _pread_into(fd, base + lo_len, memoryview(hi_raw))
+                    hi_bytes = decompressor.decompress(
+                        memoryview(hi_raw), max_output_size=half
+                    )
+                    if lo_len != half or lo_len * 2 != n_out or len(hi_bytes) != half:
+                        raise ValueError("fpz frame plane size mismatch")
+                    hi_pin[slot][:half].copy_(
+                        torch.frombuffer(hi_bytes, dtype=torch.uint8)
+                    )
+
                     seg = dst.narrow(0, out_pos, n_out)
                     with torch.cuda.stream(stream):
-                        lo_dev[:half].copy_(lo_pin[:half], non_blocking=True)
-                        hi_dev[:half].copy_(hi_pin[:half], non_blocking=True)
-                        seg[0::2].copy_(lo_dev[:half], non_blocking=True)
-                        seg[1::2].copy_(hi_dev[:half], non_blocking=True)
-                    stream.synchronize()
+                        lo_dev[slot][:half].copy_(lo_pin[slot][:half], non_blocking=True)
+                        hi_dev[slot][:half].copy_(hi_pin[slot][:half], non_blocking=True)
+                        seg[0::2].copy_(lo_dev[slot][:half], non_blocking=True)
+                        seg[1::2].copy_(hi_dev[slot][:half], non_blocking=True)
+                        events[slot].record(stream)
             finally:
                 os.close(fd)
             stream.synchronize()
