@@ -15,9 +15,11 @@ from .constants import (
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
     FPZ_CODEC_SPLITPLANE_V1,
+    FPZ_CODEC_SPLITPLANE_V2,
     FPZ_COMPRESS_BF16,
     FPZ_FRAME_ALIGN_BYTES,
     FPZ_FRAME_UNCOMPRESSED_BYTES,
+    FPZ_HI_CHUNK_UNCOMPRESSED_BYTES,
     MAGIC,
     U64LE,
 )
@@ -469,17 +471,67 @@ def _fpz_encode_frame(f, block_start: int, frame_u8: np.ndarray, compressor) -> 
     }
 
 
+# Default fpz codec version written by the streaming encoder. v2 (chunked high
+# plane) is the GPU-decodable format; tests set this to 1 to exercise the
+# v1-still-reads backward-compatibility path.
+_DEFAULT_FPZ_VERSION = 2
+
+
+def _fpz_encode_frame_v2(
+    f, block_start: int, frame_u8: np.ndarray, chunk_compressor
+) -> dict:
+    """Encode one split-plane frame with a CHUNKED high plane (codec v2).
+
+    Same low/high split as v1, but the high plane is compressed as a sequence of
+    independent zstd frames of ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` uncompressed
+    bytes each (the frame's last chunk holds the remainder). Many small chunks
+    are what a GPU decoder needs to decompress in parallel; the frame record
+    lists each chunk's compressed length so the reader locates them by prefix
+    sum. Ratio drops slightly versus v1 because each chunk compresses without
+    the neighbouring chunks' context.
+    """
+    n_out = int(frame_u8.shape[0])
+    lo = np.ascontiguousarray(frame_u8[0::2])
+    hi = np.ascontiguousarray(frame_u8[1::2])
+    lo_bytes = lo.tobytes()
+    half = int(hi.shape[0])
+    chunk = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
+    hi_z_chunks = [
+        chunk_compressor.compress(hi[off : off + chunk].tobytes())
+        for off in range(0, half, chunk)
+    ]
+
+    payload_off = f.tell() - block_start
+    pad = (-payload_off) % FPZ_FRAME_ALIGN_BYTES
+    if pad:
+        f.write(b"\x00" * pad)
+        payload_off += pad
+
+    f.write(lo_bytes)
+    hi_chunks: list[int] = []
+    for z in hi_z_chunks:
+        f.write(z)
+        hi_chunks.append(int(len(z)))
+    return {
+        "payload_off": int(payload_off),
+        "lo_len": int(len(lo_bytes)),
+        "n_out": int(n_out),
+        "hi_chunks": hi_chunks,
+    }
+
+
 def _fpz_stream_compress_block(
     f,
     block_start: int,
     block: MacroblockPlan,
     state_dict: dict[str, torch.Tensor],
-    compressor,
+    encode_frame,
     progress: "tqdm.tqdm | None",
 ) -> list[dict]:
     """Stream one bf16 macroblock through a rolling ``FPZ_FRAME_UNCOMPRESSED_BYTES``
-    buffer, emitting a split-plane frame each time it fills (and once more for
-    the tail). Peak extra memory is one frame buffer plus one source tensor."""
+    buffer, emitting a split-plane frame (via ``encode_frame``) each time it
+    fills (and once more for the tail). Peak extra memory is one frame buffer
+    plus one source tensor."""
     frame_bytes = FPZ_FRAME_UNCOMPRESSED_BYTES
     buf = np.empty(frame_bytes, dtype=np.uint8)
     fill = 0
@@ -494,7 +546,7 @@ def _fpz_stream_compress_block(
                 fill += take
                 remaining -= take
                 if fill == frame_bytes:
-                    frames.append(_fpz_encode_frame(f, block_start, buf, compressor))
+                    frames.append(encode_frame(f, block_start, buf))
                     fill = 0
         else:
             arr = data
@@ -506,11 +558,11 @@ def _fpz_stream_compress_block(
                 fill += take
                 pos += take
                 if fill == frame_bytes:
-                    frames.append(_fpz_encode_frame(f, block_start, buf, compressor))
+                    frames.append(encode_frame(f, block_start, buf))
                     fill = 0
 
     if fill > 0:
-        frames.append(_fpz_encode_frame(f, block_start, buf[:fill], compressor))
+        frames.append(encode_frame(f, block_start, buf[:fill]))
     return frames
 
 
@@ -534,10 +586,30 @@ def _write_fpz_pack_streaming(
     byte-compatible with the read path.
     """
     zstandard = require_zstandard()
-    # threads=-1 = one worker per core: a ~19GB high plane at single-threaded
-    # zstd-3 (~0.4 GB/s) would take ~45 min per repack; multithreaded frames
-    # keep converter jobs in minutes. Frame outputs are byte-compatible.
-    compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL, threads=-1)
+    version = _DEFAULT_FPZ_VERSION
+    if version == 2:
+        # v2 compresses each 64 KiB high-plane chunk as its own zstd frame.
+        # threads=-1 (one worker per core) does nothing for a 64 KiB input and
+        # only adds per-call overhead, so use a single-threaded compressor;
+        # parallelism at repack time now comes from the many chunks, not from
+        # one big multithreaded compress. (Chunks are compressed serially here;
+        # a chunk-level thread pool is a repack-speed follow-up if needed.)
+        chunk_compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL)
+
+        def encode_frame(f_, block_start_, frame_u8_):
+            return _fpz_encode_frame_v2(f_, block_start_, frame_u8_, chunk_compressor)
+
+        codec_name = FPZ_CODEC_SPLITPLANE_V2
+    else:
+        # threads=-1 = one worker per core: a ~19GB high plane at single-threaded
+        # zstd-3 (~0.4 GB/s) would take ~45 min per repack; multithreaded frames
+        # keep converter jobs in minutes. Frame outputs are byte-compatible.
+        compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL, threads=-1)
+
+        def encode_frame(f_, block_start_, frame_u8_):
+            return _fpz_encode_frame(f_, block_start_, frame_u8_, compressor)
+
+        codec_name = FPZ_CODEC_SPLITPLANE_V1
 
     fd_tmp, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=".packtmp_")
     os.close(fd_tmp)
@@ -565,11 +637,11 @@ def _write_fpz_pack_streaming(
                 }
                 if compress_flags[block_id]:
                     frames = _fpz_stream_compress_block(
-                        f, block_offset, block, state_dict, compressor, progress
+                        f, block_offset, block, state_dict, encode_frame, progress
                     )
                     record["length_bytes"] = int(f.tell() - block_offset)
                     record["fpz"] = {
-                        "codec": FPZ_CODEC_SPLITPLANE_V1,
+                        "codec": codec_name,
                         "frames": frames,
                     }
                 else:

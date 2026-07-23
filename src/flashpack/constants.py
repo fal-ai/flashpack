@@ -20,6 +20,18 @@ DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MiB
 # frame payload start 4096-byte aligned relative to the macroblock start.
 FPZ_COMPRESS_BF16 = "fpz-bf16"
 FPZ_CODEC_SPLITPLANE_V1 = "zstd-splitplane-v1"
+# v2 chunks each frame's high plane into many small independent zstd frames so a
+# GPU decoder (nvcomp) gets its native many-chunk batch shape. A single-frame
+# (v1) high plane is ONE nvcomp chunk and decodes serially on the GPU (~0.6
+# GB/s); v2's chunks decode in parallel. In a v2 frame the payload is
+# [lo raw bytes][hi zstd chunk 0][hi zstd chunk 1]... and the frame record
+# carries "hi_chunks": the per-chunk compressed byte lengths (each chunk's
+# uncompressed size is FPZ_HI_CHUNK_UNCOMPRESSED_BYTES except the frame's last).
+FPZ_CODEC_SPLITPLANE_V2 = "zstd-splitplane-v2"
 FPZ_FRAME_UNCOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
 FPZ_FRAME_ALIGN_BYTES = 4096
+# Per-chunk uncompressed size for the v2 high plane. Matches nvcomp's default
+# uncomp_chunk_size (65536) and divides the 32 MiB half-frame evenly (512
+# chunks), so full frames have no odd-sized tail chunk.
+FPZ_HI_CHUNK_UNCOMPRESSED_BYTES = 64 * 1024
 DEFAULT_ZSTD_LEVEL = 3

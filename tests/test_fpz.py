@@ -15,10 +15,12 @@ import time
 import numpy as np
 import pytest
 import torch
+from flashpack import serialization
 from flashpack.constants import (
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
     FPZ_CODEC_SPLITPLANE_V1,
+    FPZ_CODEC_SPLITPLANE_V2,
     FPZ_FRAME_ALIGN_BYTES,
 )
 from flashpack.deserialization import (
@@ -81,8 +83,10 @@ def test_compressed_file_is_v4_with_fpz_record(tmp_path) -> None:
     meta = get_flashpack_file_metadata(comp)
     assert meta["format"] == FILE_FORMAT_V4
     (block,) = meta["macroblocks"]
-    assert block["fpz"]["codec"] == FPZ_CODEC_SPLITPLANE_V1
+    assert block["fpz"]["codec"] == FPZ_CODEC_SPLITPLANE_V2
     assert len(block["fpz"]["frames"]) >= 1
+    # v2 frames carry per-chunk compressed lengths instead of a single hi_len.
+    assert block["fpz"]["frames"][0]["hi_chunks"]
     # length_elems stays logical; length_bytes is the smaller on-disk payload.
     assert block["length_bytes"] < block["length_elems"] * 2
 
@@ -244,10 +248,11 @@ def test_corrupt_high_plane_rejected(tmp_path) -> None:
     block = get_flashpack_file_metadata(comp)["macroblocks"][0]
     frame = block["fpz"]["frames"][0]
     hi_start = block["offset_bytes"] + frame["payload_off"] + frame["lo_len"]
-    # Scribble over the compressed high plane; zstd must reject it on read.
+    # Scribble over the first compressed high-plane chunk; zstd must reject it.
+    first_chunk_len = int(frame["hi_chunks"][0])
     with open(comp, "r+b") as f:
         f.seek(hi_start)
-        f.write(b"\xff" * min(64, frame["hi_len"]))
+        f.write(b"\xff" * min(64, first_chunk_len))
     zstandard = require_zstandard()
     with pytest.raises((zstandard.ZstdError, ValueError)):
         read_flashpack_file(comp, device="cpu")
@@ -412,3 +417,64 @@ def test_cpu_decode_scales_with_threads(tmp_path, monkeypatch) -> None:
         f"fpz CPU decode did not scale: 1-thread={single * 1e3:.1f} ms, "
         f"8-thread={multi * 1e3:.1f} ms (expected 8-thread <= 0.6x)"
     )
+
+
+# --------------------------------------------------------------------------
+# v2 (chunked high plane) format + v1 backward compatibility
+# --------------------------------------------------------------------------
+
+
+def test_v2_frame_splits_high_plane_into_chunks(tmp_path) -> None:
+    # A 1024x512 bf16 tensor has a 512 KiB high plane -> several 64 KiB chunks.
+    source = {"w": torch.randn(1024, 512).to(torch.bfloat16)}
+    comp = _pack(tmp_path, source, "comp.flashpack", compress="fpz-bf16")
+    block = get_flashpack_file_metadata(comp)["macroblocks"][0]
+    assert block["fpz"]["codec"] == FPZ_CODEC_SPLITPLANE_V2
+    (frame,) = block["fpz"]["frames"]
+    assert len(frame["hi_chunks"]) >= 2  # multiple parallel-decodable chunks
+    # Round-trips bit-exactly through the chunked decode.
+    storage, meta = read_flashpack_file(comp, device="cpu")
+    (w,) = [t for _, t in iterate_from_flash_tensor(storage, meta)]
+    assert torch.equal(_uint16_view(w), _uint16_view(source["w"]))
+
+
+def test_v1_pack_still_reads(tmp_path, monkeypatch) -> None:
+    # Backward compatibility: a pack written by the v1 encoder must still decode
+    # bit-exactly (the reader supports both codecs).
+    monkeypatch.setattr(serialization, "_DEFAULT_FPZ_VERSION", 1)
+    source = _bf16_state_dict()
+    comp = _pack(tmp_path, source, "comp_v1.flashpack", compress="fpz-bf16")
+    block = get_flashpack_file_metadata(comp)["macroblocks"][0]
+    assert block["fpz"]["codec"] == FPZ_CODEC_SPLITPLANE_V1
+    assert "hi_len" in block["fpz"]["frames"][0]  # single-frame high plane
+
+    storage, meta = read_flashpack_file(comp, device="cpu")
+    tensors = dict(iterate_from_flash_tensor(storage, meta))
+    for name, original in source.items():
+        assert torch.equal(_uint16_view(tensors[name]), _uint16_view(original))
+
+
+def test_v2_ratio_close_to_v1(tmp_path, monkeypatch, capsys) -> None:
+    # v2 compresses each 64 KiB chunk independently, so it shrinks slightly less
+    # than v1's single-frame high plane. Measure both on a realistic low-entropy
+    # tensor; v2 must still compress and stay within a modest margin of v1.
+    ramp = (torch.arange(2048 * 1024, dtype=torch.float32) * 0.01).reshape(2048, 1024)
+    source = {"w": ramp.to(torch.bfloat16)}
+    plain = _pack(tmp_path, source, "plain.flashpack")
+
+    monkeypatch.setattr(serialization, "_DEFAULT_FPZ_VERSION", 1)
+    v1 = _pack(tmp_path, source, "v1.flashpack", compress="fpz-bf16")
+    monkeypatch.setattr(serialization, "_DEFAULT_FPZ_VERSION", 2)
+    v2 = _pack(tmp_path, source, "v2.flashpack", compress="fpz-bf16")
+
+    plain_sz = os.path.getsize(plain)
+    v1_sz = os.path.getsize(v1)
+    v2_sz = os.path.getsize(v2)
+    with capsys.disabled():
+        print(
+            f"\n[fpz] ratio plain={plain_sz} "
+            f"v1={v1_sz} ({plain_sz / v1_sz:.3f}x) "
+            f"v2={v2_sz} ({plain_sz / v2_sz:.3f}x) v2/v1={v2_sz / v1_sz:.3f}"
+        )
+    assert v2_sz < plain_sz  # v2 still compresses
+    assert v2_sz <= v1_sz * 1.25  # within a modest margin of v1

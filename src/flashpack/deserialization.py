@@ -20,7 +20,9 @@ from .constants import (
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
     FPZ_CODEC_SPLITPLANE_V1,
+    FPZ_CODEC_SPLITPLANE_V2,
     FPZ_FRAME_UNCOMPRESSED_BYTES,
+    FPZ_HI_CHUNK_UNCOMPRESSED_BYTES,
     MAGIC,
     U64LE,
 )
@@ -154,7 +156,7 @@ def _build_macroblock_specs(meta: dict[str, Any]) -> list[MacroblockSpec]:
             fpz = block.get("fpz")
             if fpz is not None:
                 codec = fpz.get("codec")
-                if codec != FPZ_CODEC_SPLITPLANE_V1:
+                if codec not in (FPZ_CODEC_SPLITPLANE_V1, FPZ_CODEC_SPLITPLANE_V2):
                     raise ValueError(f"Unsupported fpz codec: {codec!r}")
             specs.append(
                 MacroblockSpec(
@@ -386,28 +388,51 @@ def _fpz_read_frame_planes(
     """Read one fpz frame and return its ``(lo, hi)`` byte planes as uint8
     numpy arrays, each ``n_out // 2`` bytes.
 
-    Shared decode step for the CPU and CUDA read paths: the ``preadv`` read and
-    the zstd decode of the high plane. zstd ``decompress`` releases the GIL and
-    accepts the compressed input as a buffer, so the read target is passed as a
-    ``memoryview`` (no intermediate ``bytes`` copy) and N threads scale near
-    linearly. A future GPU decoder (nvcomp) can replace only the decompress
-    call behind this same frame interface.
+    Shared CPU decode step for both read paths and both codec versions. v1
+    frames store the high plane as a single zstd frame (``hi_len``); v2 frames
+    store it as many ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` chunks whose compressed
+    lengths are in ``hi_chunks``. zstd ``decompress`` releases the GIL and takes
+    the compressed input as a buffer, so read targets are ``memoryview``s (no
+    intermediate ``bytes`` copy) and N threads scale near linearly.
     """
     payload_off = int(frame["payload_off"])
     lo_len = int(frame["lo_len"])
-    hi_len = int(frame["hi_len"])
     n_out = int(frame["n_out"])
     half = n_out - lo_len
 
     lo_raw = bytearray(lo_len)
     _pread_into(fd, block_file_offset + payload_off, memoryview(lo_raw))
-    hi_raw = bytearray(hi_len)
-    _pread_into(fd, block_file_offset + payload_off + lo_len, memoryview(hi_raw))
+    lo = np.frombuffer(lo_raw, dtype=np.uint8)
+    hi_base = block_file_offset + payload_off + lo_len
 
+    if "hi_chunks" in frame:
+        # v2: decode each chunk (a standalone zstd frame) into its slice.
+        chunk_u = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
+        hi = np.empty(half, dtype=np.uint8)
+        uoff = 0
+        src_off = hi_base
+        for clen in frame["hi_chunks"]:
+            clen = int(clen)
+            usize = min(chunk_u, half - uoff)
+            cbuf = bytearray(clen)
+            _pread_into(fd, src_off, memoryview(cbuf))
+            dec = decompressor.decompress(memoryview(cbuf), max_output_size=usize)
+            if len(dec) != usize:
+                raise ValueError("fpz v2 chunk size mismatch")
+            hi[uoff : uoff + usize] = np.frombuffer(dec, dtype=np.uint8)
+            uoff += usize
+            src_off += clen
+        if lo_len * 2 != n_out or uoff != half or lo.shape[0] != lo_len:
+            raise ValueError("fpz frame plane size mismatch")
+        return lo, hi
+
+    # v1: the high plane is a single zstd frame.
+    hi_len = int(frame["hi_len"])
+    hi_raw = bytearray(hi_len)
+    _pread_into(fd, hi_base, memoryview(hi_raw))
     # memoryview input avoids a GIL-held full copy of the compressed plane;
     # decompress itself releases the GIL.
     hi_bytes = decompressor.decompress(memoryview(hi_raw), max_output_size=half)
-    lo = np.frombuffer(lo_raw, dtype=np.uint8)
     hi = np.frombuffer(hi_bytes, dtype=np.uint8)
     if lo_len * 2 != n_out or lo.shape[0] != lo_len or hi.shape[0] != half:
         raise ValueError("fpz frame plane size mismatch")
@@ -555,7 +580,6 @@ def _fpz_read_into_cuda_storage(
                 torch.empty(half_cap, dtype=torch.uint8, device=device)
                 for _ in range(n_slots)
             ]
-            lo_view = [memoryview(b.numpy()) for b in lo_pin]
             events = [torch.cuda.Event() for _ in range(n_slots)]
             for ev in events:
                 ev.record(stream)
@@ -583,27 +607,15 @@ def _fpz_read_into_cuda_storage(
                     # its pinned buffers.
                     events[slot].synchronize()
 
-                    payload_off = int(frame["payload_off"])
-                    lo_len = int(frame["lo_len"])
-                    hi_len = int(frame["hi_len"])
                     n_out = int(frame["n_out"])
-                    half = n_out - lo_len
-                    base = specs[blk].offset_bytes + payload_off
-
-                    # Low plane: preadv straight into the pinned buffer (no
-                    # intermediate numpy/bytearray copy).
-                    _pread_into(fd, base, lo_view[slot][:lo_len])
-                    # High plane: decode (GIL released), then one copy into pin.
-                    hi_raw = bytearray(hi_len)
-                    _pread_into(fd, base + lo_len, memoryview(hi_raw))
-                    hi_bytes = decompressor.decompress(
-                        memoryview(hi_raw), max_output_size=half
+                    # Shared CPU decode (handles both v1 single-frame and v2
+                    # chunked high planes), then copy both planes into pinned.
+                    lo_np, hi_np = _fpz_read_frame_planes(
+                        fd, specs[blk].offset_bytes, frame, decompressor
                     )
-                    if lo_len != half or lo_len * 2 != n_out or len(hi_bytes) != half:
-                        raise ValueError("fpz frame plane size mismatch")
-                    hi_pin[slot][:half].copy_(
-                        torch.frombuffer(hi_bytes, dtype=torch.uint8)
-                    )
+                    half = int(hi_np.shape[0])
+                    lo_pin[slot].numpy()[:half] = lo_np
+                    hi_pin[slot].numpy()[:half] = hi_np
 
                     seg = dst.narrow(0, out_pos, n_out)
                     with torch.cuda.stream(stream):
@@ -834,21 +846,44 @@ def _install_torch_nvcomp_allocator(nvcomp, device: torch.device) -> bool:
     return True
 
 
-# GPU-decode tuning knobs (env-overridable). Each staging *slot* holds, for a
-# whole batch, the low / compressed-high / decompressed-high device planes
-# (~3 x FPZ_FRAME_UNCOMPRESSED_BYTES/2 per frame) plus pinned host buffers for
-# the low and compressed-high reads (~2 x). We keep ``n_slots`` such sets per
-# thread and double-buffer across them, so the rough per-thread device
-# footprint is ``n_slots * batch_frames * 3 * (FPZ_FRAME_UNCOMPRESSED_BYTES/2)``
-# and pinned ``n_slots * batch_frames * 2 * (...)``; total scales by the thread
-# count. Fewer threads than the CPU path: with sync-free decode each thread now
-# pipelines read/H2D/decode/interleave across its slots, so 2 threads x 2 slots
-# already overlap well. Defaults target an H200-class GPU -- turn them down on
-# smaller cards.
-_FPZ_GPU_DEFAULT_THREADS = 2
-_FPZ_GPU_DEFAULT_BATCH_FRAMES = 8
+# GPU-decode tuning knobs (env-overridable).
+#
+# Pipeline math (why these defaults). With v2 the GPU decode is fast and
+# parallel, so the bottleneck moves to the file read: at the measured ~0.8 GB/s
+# per-thread FUSE rate, and reading ~0.6x the logical bytes (the raw low plane
+# plus the compressed high plane), hitting ~18 GB/s logical needs
+# 0.6*18/0.8 ~= 14 read threads. So we restore the CPU path's read parallelism
+# (~16 threads) instead of the 2 that the sync-free round used. Each thread
+# reads AND decodes; preads (GIL released) overlap across threads and decodes
+# overlap reads via the per-thread double-buffered slots.
+#
+# Memory: each slot holds the low / compressed-high / decompressed-high device
+# planes (~3 x FPZ_FRAME_UNCOMPRESSED_BYTES/2 per frame) plus pinned host
+# buffers (~2 x). Per-thread device ~= n_slots * batch_frames * 3 * 32 MiB and
+# pinned ~= n_slots * batch_frames * 2 * 32 MiB; total scales by thread count.
+# batch_frames=1 keeps per-thread memory small so we can afford ~16 threads
+# (16*2*1*160 MiB ~= 5 GB device, ~2 GB pinned) -- and one 64 MiB frame already
+# holds ~512 hi chunks, which is plenty of work for one nvcomp batched decode.
+_FPZ_GPU_DEFAULT_THREADS = 16
+_FPZ_GPU_DEFAULT_BATCH_FRAMES = 1
 _FPZ_GPU_DEFAULT_BATCH_BYTES = 1024 * 1024 * 1024  # summed uncompressed per batch
 _FPZ_GPU_DEFAULT_SLOTS = 2  # double-buffer depth per thread
+
+
+def _fpz_hi_chunk_usizes(half: int, chunk_u: int) -> list[int]:
+    """Uncompressed sizes of a v2 frame's high-plane chunks (pure function).
+
+    ``half`` bytes split into ``chunk_u``-sized pieces, the last holding the
+    remainder. Matches the encoder's chunking, and is the per-element shape the
+    GPU decode's DecompressConfig is keyed on.
+    """
+    if half < 0 or chunk_u < 1:
+        raise ValueError("half must be >= 0 and chunk_u >= 1")
+    full, rem = divmod(half, chunk_u)
+    sizes = [chunk_u] * full
+    if rem:
+        sizes.append(rem)
+    return sizes
 
 
 def _fpz_batch_signature(batch: list[tuple]) -> tuple[int, ...]:
@@ -913,41 +948,44 @@ def _fpz_read_into_cuda_storage_gpu(
     device: torch.device,
     nvcomp,
 ) -> None:
-    """GPU-decode variant of :func:`_fpz_read_into_cuda_storage`.
+    """GPU-decode variant of :func:`_fpz_read_into_cuda_storage` for v2 packs.
 
-    Same threaded reader structure and destination contract, but the high plane
-    is decompressed on the device with nvcomp's batched Zstd decoder instead of
-    on the CPU. Per reader thread: read the low and compressed-high planes into
-    pinned staging, H2D both (moving the *compressed* high plane cuts PCIe
-    traffic ~2.4x), batch-decode the high planes on the GPU straight into the
-    device high-plane staging, then run the same strided interleave
+    v2 stores each frame's high plane as many small independent zstd chunks
+    (``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` each). That is nvcomp's native shape:
+    the whole point of the GPU decoder is decoding MANY chunks in parallel. A v1
+    single-frame high plane is one nvcomp chunk and decodes serially (~0.6 GB/s
+    measured, tier-flat), which is why the caller routes v1 to the CPU path.
+
+    Per reader thread: read a frame's low plane and its whole compressed-high
+    blob into pinned staging, H2D both (moving the compressed high plane cuts
+    PCIe traffic ~2.4x), then submit ALL of the frame's high chunks as one
+    ``codec.decode`` batch (hundreds of Arrays), decoding straight into the
+    device high-plane staging; finally the same strided interleave
     (``dst[0::2] = lo``, ``dst[1::2] = hi``).
 
-    Throughput hinges on NOT synchronizing per decode. The naive path (no
-    ``decompression_config``) makes ``decode`` call ``configure_decompression``
-    internally, which "synchronizes the codec's CUDA stream" on every call --
-    that serializes read/H2D/decode/interleave and measured ~0.6 GB/s on the
-    H200 (15x slower than CPU decode). Instead we build a reusable
-    ``DecompressConfig`` per distinct batch shape (keyed by
-    :func:`_fpz_batch_signature`) with a single sync, cache it, and pass it to
-    ``decode`` so every subsequent decode of that shape is sync-free. fpz packs
-    are a handful of shapes (full 64 MiB frames plus one tail per block), so the
-    one-time ``decompression_config`` sync is paid only a few times per thread.
+    Two throughput levers, both load-bearing:
 
-    Removing the implicit sync means we must guard staging-buffer reuse
-    ourselves: each thread keeps ``n_slots`` staging sets and double-buffers
-    across them, recording a CUDA event after a batch's decode+interleave and
-    ``synchronize``-ing that event before reusing the slot -- the same
-    event-gated double-buffer the CPU-decode path uses. Within a slot all device
-    work is enqueued on the one stream, so H2D -> decode -> interleave stay
-    ordered without per-op syncs. Each thread owns its fd, stream, Codec and
-    config cache. Raw (uncompressed) blocks take the same whole-block H2D as the
-    CPU-decode path.
+    * No per-decode sync. The naive path makes ``decode`` call
+      ``configure_decompression`` (a stream sync) every call. We build a
+      reusable ``DecompressConfig`` per distinct chunk-shape signature (one sync
+      each) and pass it to ``decode``; since v2 chunks are almost all a uniform
+      64 KiB, that is ~1-2 configs total per thread and every steady-state decode
+      is sync-free. Reuse safety without the sync comes from an event-gated
+      double buffer (``n_slots`` staging sets; ``synchronize`` a slot's event
+      before reusing it, ``record`` it after decode+interleave).
+    * Read parallelism. Read (not decode) is now the bottleneck, so we use many
+      threads (see the tuning-knob pipeline math); preads overlap across threads
+      and decodes overlap reads via the slots.
+
+    Each thread owns its fd, stream, Codec and config cache. Raw (uncompressed)
+    blocks take the same whole-block H2D as the CPU-decode path.
     """
     half_cap = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
-    # zstd worst-case output for a half_cap input; each frame's stored hi_len
-    # never exceeds this (its input is at most half_cap bytes).
-    comp_cap = half_cap + (half_cap // 255) + 4096
+    chunk_u = FPZ_HI_CHUNK_UNCOMPRESSED_BYTES
+    max_chunks = (half_cap + chunk_u - 1) // chunk_u
+    # Upper bound on a frame's whole compressed-high blob: the zstd bound for
+    # half_cap uncompressed, plus per-chunk zstd frame-header overhead.
+    comp_cap = half_cap + (half_cap // 255) + max_chunks * 64 + 4096
 
     n_threads = max(
         1, _env_int("FLASHPACK_FPZ_GPU_DECODE_THREADS", _FPZ_GPU_DEFAULT_THREADS)
@@ -1042,17 +1080,21 @@ def _fpz_read_into_cuda_storage_gpu(
                 torch.empty(batch_frames * half_cap, dtype=torch.uint8, device=device)
                 for _ in range(n_slots)
             ]
-            # Hoist the decode out= wrappers: one nvcomp.Array per (slot, frame)
-            # over the full half_cap slice, built ONCE. decode writes the true
-            # (config-driven) size <= half_cap into it, so the same wrappers serve
-            # every batch regardless of shape -- no per-batch out construction.
-            # (The compressed-in src wrappers stay per-batch, sized to the exact
-            # hi_len, so nvcomp never sees trailing bytes past the single zstd
-            # frame.)
+            # Hoist the decode out= wrappers: one nvcomp.Array per
+            # (slot, frame, chunk) over a fixed chunk_u slice at frame k's
+            # chunk j offset, built ONCE (layout is data-independent). decode
+            # writes the true (config-driven) size <= chunk_u into each, so the
+            # same wrappers serve every batch. Indexed [slot][k*max_chunks + j].
+            # (The compressed-in src wrappers stay per-batch, sized to each
+            # chunk's exact compressed length, so nvcomp sees exactly one zstd
+            # frame per Array.)
             out_wrap = [
                 [
-                    nvcomp.as_array(hi_dev[s].narrow(0, k * half_cap, half_cap))
+                    nvcomp.as_array(
+                        hi_dev[s].narrow(0, k * half_cap + j * chunk_u, chunk_u)
+                    )
                     for k in range(batch_frames)
+                    for j in range(max_chunks)
                 ]
                 for s in range(n_slots)
             ]
@@ -1094,23 +1136,32 @@ def _fpz_read_into_cuda_storage_gpu(
                         t_evsync += time.perf_counter() - _t
 
                     halves: list[int] = []
-                    hi_lens: list[int] = []
-                    # Read every frame's planes into this slot's pinned staging
-                    # and enqueue the H2D of the low plane and the (small)
-                    # compressed high plane onto the stream.
+                    srcs: list = []
+                    outs: list = []
+                    sig_parts: list[int] = []
+                    # Read every frame's planes into this slot's pinned staging,
+                    # H2D them, and build the per-chunk src/out Array batch.
                     for k, (_, blk, frame, _out_pos) in enumerate(batch):
                         payload_off = int(frame["payload_off"])
                         lo_len = int(frame["lo_len"])
-                        hi_len = int(frame["hi_len"])
                         n_out = int(frame["n_out"])
                         half = n_out - lo_len
+                        hi_chunks = frame.get("hi_chunks")
+                        if hi_chunks is None:
+                            raise ValueError(
+                                "GPU fpz decode requires a v2 (chunked) pack"
+                            )
                         if lo_len != half or lo_len * 2 != n_out:
                             raise ValueError("fpz frame plane size mismatch")
-                        if hi_len > comp_cap:
+                        hi_len_total = sum(int(c) for c in hi_chunks)
+                        if hi_len_total > comp_cap:
                             raise ValueError(
-                                f"fpz compressed frame ({hi_len} bytes) exceeds "
+                                f"fpz compressed frame ({hi_len_total} bytes) exceeds "
                                 f"staging capacity ({comp_cap} bytes)"
                             )
+                        usizes = _fpz_hi_chunk_usizes(half, chunk_u)
+                        if len(usizes) != len(hi_chunks):
+                            raise ValueError("fpz v2 chunk count mismatch")
                         base = specs[blk].offset_bytes + payload_off
                         lo_off = k * half_cap
                         hiz_off = k * comp_cap
@@ -1121,35 +1172,38 @@ def _fpz_read_into_cuda_storage_gpu(
                         _pread_into(
                             fd,
                             base + lo_len,
-                            hiz_pin_view[slot][hiz_off : hiz_off + hi_len],
+                            hiz_pin_view[slot][hiz_off : hiz_off + hi_len_total],
                         )
                         if trace_on:
                             t_pread += time.perf_counter() - _t
                         halves.append(half)
-                        hi_lens.append(hi_len)
                         _t = time.perf_counter() if trace_on else 0.0
                         with torch.cuda.stream(stream):
                             lo_dev[slot].narrow(0, lo_off, half).copy_(
                                 lo_pin[slot].narrow(0, lo_off, half), non_blocking=True
                             )
-                            hiz_dev[slot].narrow(0, hiz_off, hi_len).copy_(
-                                hiz_pin[slot].narrow(0, hiz_off, hi_len),
+                            hiz_dev[slot].narrow(0, hiz_off, hi_len_total).copy_(
+                                hiz_pin[slot].narrow(0, hiz_off, hi_len_total),
                                 non_blocking=True,
                             )
                         if trace_on:
                             t_h2d += time.perf_counter() - _t
+                        # One src Array per compressed chunk (exact length) and
+                        # its hoisted out wrapper; chunk usizes drive the config.
+                        coff = hiz_off
+                        for j, clen in enumerate(hi_chunks):
+                            clen = int(clen)
+                            srcs.append(
+                                nvcomp.as_array(hiz_dev[slot].narrow(0, coff, clen))
+                            )
+                            outs.append(out_wrap[slot][k * max_chunks + j])
+                            coff += clen
+                        sig_parts.extend(usizes)
 
-                    srcs = [
-                        nvcomp.as_array(
-                            hiz_dev[slot].narrow(0, k * comp_cap, hi_lens[k])
-                        )
-                        for k in range(len(batch))
-                    ]
-                    outs = out_wrap[slot][: len(batch)]
-                    # Reusable config per batch shape: build once (one sync, waits
-                    # on the H2D above), then decode sync-free here and on every
-                    # later batch that shares the shape.
-                    sig = _fpz_batch_signature(batch)
+                    # Reusable config per chunk-shape signature: build once (one
+                    # sync, waits on the H2D above), then decode sync-free here
+                    # and on every later batch that shares the shape.
+                    sig = tuple(sig_parts)
                     _t = time.perf_counter() if trace_on else 0.0
                     cfg = configs.get(sig)
                     if cfg is None:
@@ -1221,10 +1275,23 @@ def _fpz_read_into_cuda_storage_gpu(
         raise errors[0]
 
 
+_FPZ_V1_GPU_WARNED = False
+
+
+def _fpz_specs_all_v2(specs: list[MacroblockSpec]) -> bool:
+    """True if every fpz block uses the v2 (chunked) codec -- the only format
+    the GPU decoder can decompress in parallel."""
+    for spec in specs:
+        if spec.fpz is not None and spec.fpz.get("codec") != FPZ_CODEC_SPLITPLANE_V2:
+            return False
+    return True
+
+
 def _read_fpz_into_storage(
     path: str, specs: list[MacroblockSpec], device: torch.device
 ) -> FlashTensorStorage:
     """Materialize an fpz (partially compressed) pack into ``device`` storage."""
+    global _FPZ_V1_GPU_WARNED
     if device.type == "cpu":
         storage = _allocate_aligned_cpu_storage(specs)
         _fpz_read_into_cpu_storage(path, specs, storage.blocks)
@@ -1232,6 +1299,20 @@ def _read_fpz_into_storage(
     if device.type == "cuda":
         storage = _allocate_empty_storage(specs, device)
         nvcomp = _load_nvcomp() if _fpz_gpu_decode_enabled() else None
+        # The GPU decoder only helps v2 (chunked) packs; a v1 pack is one nvcomp
+        # chunk per frame and decodes serially, so fall back to the threaded CPU
+        # decode for it (still correct, and faster than serial GPU decode).
+        if nvcomp is not None and not _fpz_specs_all_v2(specs):
+            nvcomp = None
+            if not _FPZ_V1_GPU_WARNED:
+                _FPZ_V1_GPU_WARNED = True
+                warnings.warn(
+                    "FLASHPACK_FPZ_GPU_DECODE=1 but this pack uses the v1 fpz "
+                    "codec, which cannot be GPU-decoded in parallel; using the "
+                    "CPU decode path. Repack with the v2 encoder for GPU decode.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         if nvcomp is not None:
             _fpz_read_into_cuda_storage_gpu(path, specs, storage.blocks, device, nvcomp)
         else:

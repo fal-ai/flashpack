@@ -17,6 +17,7 @@ from flashpack.deserialization import (
     _env_flag_default,
     _fpz_batch_signature,
     _fpz_gpu_decode_enabled,
+    _fpz_hi_chunk_usizes,
     _load_nvcomp,
     iterate_from_flash_tensor,
     plan_fpz_gpu_batches,
@@ -115,6 +116,39 @@ def test_signature_differs_when_a_tail_frame_changes_shape() -> None:
     full = [_frame_task(0, 128), _frame_task(0, 128)]
     with_tail = [_frame_task(0, 128), _frame_task(0, 40)]
     assert _fpz_batch_signature(full) != _fpz_batch_signature(with_tail)
+
+
+# --------------------------------------------------------------------------
+# _fpz_hi_chunk_usizes -- pure v2 chunk sizing (matches the encoder)
+# --------------------------------------------------------------------------
+
+
+def test_hi_chunk_usizes_exact_multiple_has_no_tail() -> None:
+    # 4 * chunk -> 4 equal chunks, no remainder (the full-frame case).
+    assert _fpz_hi_chunk_usizes(4 * 64, 64) == [64, 64, 64, 64]
+
+
+def test_hi_chunk_usizes_has_remainder_tail() -> None:
+    assert _fpz_hi_chunk_usizes(200, 64) == [64, 64, 64, 8]
+
+
+def test_hi_chunk_usizes_smaller_than_one_chunk() -> None:
+    assert _fpz_hi_chunk_usizes(40, 64) == [40]
+
+
+def test_hi_chunk_usizes_zero_is_empty() -> None:
+    assert _fpz_hi_chunk_usizes(0, 64) == []
+
+
+def test_hi_chunk_usizes_sum_equals_half() -> None:
+    for half in (1, 63, 64, 65, 1000, 1 << 20):
+        assert sum(_fpz_hi_chunk_usizes(half, 64)) == half
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_hi_chunk_usizes_rejects_bad_chunk(bad: int) -> None:
+    with pytest.raises(ValueError):
+        _fpz_hi_chunk_usizes(100, bad)
 
 
 # --------------------------------------------------------------------------
