@@ -178,6 +178,31 @@ def pack_to_file(
 
     dest_dir = os.path.dirname(os.path.abspath(destination_path)) or "."
     os.makedirs(dest_dir, exist_ok=True)
+
+    # fpz path: bf16 macroblocks are split-plane zstd-compressed, every other
+    # dtype is stored verbatim. When no block is eligible the file is identical
+    # to the uncompressed pack, so fall through to the plain path below.
+    compress_flags = [
+        compress == FPZ_COMPRESS_BF16 and block.dtype is torch.bfloat16
+        for block in macroblocks
+    ]
+    if any(compress_flags):
+        # Single pass, no uncompressed scratch: convert each tensor to CPU
+        # bytes and stream them through a rolling frame buffer directly into
+        # the final compressed file.
+        with timer("fpz_stream_write", silent):
+            _write_fpz_pack_streaming(
+                state_dict=state_dict,
+                macroblocks=macroblocks,
+                index=index,
+                align_bytes=align_bytes,
+                compress_flags=compress_flags,
+                destination_path=destination_path,
+                dest_dir=dest_dir,
+                silent=silent,
+            )
+        return
+
     fd_tmp = None
     tmp_path = None
 
@@ -292,36 +317,6 @@ def pack_to_file(
             # Flush memory map
             mm.flush()
 
-        # fpz path: re-emit the (now materialized) uncompressed payload as a
-        # compressed pack. bf16 macroblocks become split-plane zstd frames;
-        # every other block is copied through verbatim. When no block is
-        # eligible the file is identical to the uncompressed pack, so fall
-        # through to the normal footer path below.
-        compress_flags = [
-            compress == FPZ_COMPRESS_BF16 and block.dtype is torch.bfloat16
-            for block in macroblocks
-        ]
-        if any(compress_flags):
-            with timer("compress_and_write", silent):
-                _write_fpz_pack(
-                    source=mm,
-                    macroblocks=macroblocks,
-                    index=index,
-                    align_bytes=align_bytes,
-                    compress_flags=compress_flags,
-                    destination_path=destination_path,
-                    dest_dir=dest_dir,
-                )
-            # Close the uncompressed scratch memmap and drop it; the compressed
-            # file is already atomically in place at destination_path.
-            mm_base = getattr(mm, "_mmap", None) or getattr(mm, "base", None)
-            if mm_base is not None:
-                mm_base.close()
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            tmp_path = None
-            return
-
         # Append footer
         if len(macroblocks) == 1:
             block = macroblocks[0]
@@ -401,74 +396,142 @@ def pack_to_file(
                 pass
 
 
-def _fpz_encode_block_to_file(
-    f,
-    block_bytes: np.ndarray,
-    compressor,
-) -> tuple[list[dict], int]:
-    """Encode one bf16 macroblock as split-plane zstd frames.
+def _write_zeros(f, n: int) -> None:
+    """Write ``n`` zero bytes to ``f`` in bounded chunks."""
+    while n > 0:
+        take = min(n, 1 << 20)
+        f.write(b"\x00" * take)
+        n -= take
 
-    ``block_bytes`` is the contiguous uint8 payload of the (uncompressed)
-    macroblock. ``f`` is a binary file positioned at the macroblock start; it
-    is left positioned at the end of the written payload. Returns the frame
-    records and the on-disk length of the compressed payload in bytes.
 
-    bf16 elements are stored little-endian, so the even bytes are the low
-    (mantissa-LSB) plane -- kept raw -- and the odd bytes are the high
-    (sign+exponent) plane -- zstd-compressed. Each frame covers up to
-    ``FPZ_FRAME_UNCOMPRESSED_BYTES`` uncompressed bytes and its payload start
-    is padded to a 4096-byte boundary relative to the macroblock start.
+def _iter_block_uncompressed_chunks(
+    block: MacroblockPlan,
+    state_dict: dict[str, torch.Tensor],
+    progress: "tqdm.tqdm | None" = None,
+):
+    """Yield a macroblock's uncompressed payload in order, reproducing the
+    memmap layout exactly.
+
+    Emits ``("zeros", nbytes)`` for the inter-tensor element-alignment gaps
+    (zero-filled, as a fresh memmap is) and ``("bytes", uint8_ndarray)`` for
+    each tensor -- the target-dtype CPU reinterpretation (packing view) that
+    the uncompressed copy loop writes. ``.to(device="cpu")`` handles the D2H
+    transfer for GPU-source tensors.
     """
-    block_start = f.tell()
-    n_total = int(block_bytes.shape[0])
+    elem_size = torch.tensor([], dtype=block.dtype).element_size()
+    packing_dtype = get_packing_dtype(block.dtype)
+    cursor_elems = 0
+    for rec in block.tensors:
+        if rec.offset > cursor_elems:
+            yield ("zeros", (rec.offset - cursor_elems) * elem_size)
+            cursor_elems = rec.offset
+        src = state_dict[rec.name]
+        src_cpu = src.view(-1).to(dtype=block.dtype, device="cpu")
+        if block.dtype != packing_dtype:
+            src_cpu = src_cpu.view(packing_dtype)
+        raw = src_cpu.contiguous().view(torch.uint8).numpy()
+        yield ("bytes", raw)
+        cursor_elems += rec.length
+        if progress is not None:
+            progress.update(1)
+    if block.total_elems > cursor_elems:
+        yield ("zeros", (block.total_elems - cursor_elems) * elem_size)
+
+
+def _fpz_encode_frame(f, block_start: int, frame_u8: np.ndarray, compressor) -> dict:
+    """Encode one split-plane zstd frame from ``frame_u8`` (the uncompressed
+    bytes of a single frame) and write it to ``f``.
+
+    bf16 elements are little-endian, so even bytes are the low (mantissa-LSB)
+    plane -- kept raw -- and odd bytes are the high (sign+exponent) plane --
+    zstd-compressed. The frame payload start is padded to a 4096-byte boundary
+    relative to the macroblock start.
+    """
+    n_out = int(frame_u8.shape[0])
+    lo = np.ascontiguousarray(frame_u8[0::2])
+    hi = np.ascontiguousarray(frame_u8[1::2])
+    lo_bytes = lo.tobytes()
+    hi_z = compressor.compress(hi.tobytes())
+
+    payload_off = f.tell() - block_start
+    pad = (-payload_off) % FPZ_FRAME_ALIGN_BYTES
+    if pad:
+        f.write(b"\x00" * pad)
+        payload_off += pad
+
+    f.write(lo_bytes)
+    f.write(hi_z)
+    return {
+        "payload_off": int(payload_off),
+        "lo_len": int(len(lo_bytes)),
+        "hi_len": int(len(hi_z)),
+        "n_out": int(n_out),
+    }
+
+
+def _fpz_stream_compress_block(
+    f,
+    block_start: int,
+    block: MacroblockPlan,
+    state_dict: dict[str, torch.Tensor],
+    compressor,
+    progress: "tqdm.tqdm | None",
+) -> list[dict]:
+    """Stream one bf16 macroblock through a rolling ``FPZ_FRAME_UNCOMPRESSED_BYTES``
+    buffer, emitting a split-plane frame each time it fills (and once more for
+    the tail). Peak extra memory is one frame buffer plus one source tensor."""
+    frame_bytes = FPZ_FRAME_UNCOMPRESSED_BYTES
+    buf = np.empty(frame_bytes, dtype=np.uint8)
+    fill = 0
     frames: list[dict] = []
-    b = 0
-    while b < n_total:
-        n_out = min(FPZ_FRAME_UNCOMPRESSED_BYTES, n_total - b)
-        frame = block_bytes[b : b + n_out]
-        lo = np.ascontiguousarray(frame[0::2])
-        hi = np.ascontiguousarray(frame[1::2])
-        lo_bytes = lo.tobytes()
-        hi_z = compressor.compress(hi.tobytes())
 
-        # 4096-align this frame's payload start relative to the block start.
-        payload_off = f.tell() - block_start
-        pad = (-payload_off) % FPZ_FRAME_ALIGN_BYTES
-        if pad:
-            f.write(b"\x00" * pad)
-            payload_off += pad
+    for kind, data in _iter_block_uncompressed_chunks(block, state_dict, progress):
+        if kind == "zeros":
+            remaining = data
+            while remaining > 0:
+                take = min(remaining, frame_bytes - fill)
+                buf[fill : fill + take] = 0
+                fill += take
+                remaining -= take
+                if fill == frame_bytes:
+                    frames.append(_fpz_encode_frame(f, block_start, buf, compressor))
+                    fill = 0
+        else:
+            arr = data
+            pos = 0
+            n = int(arr.shape[0])
+            while pos < n:
+                take = min(n - pos, frame_bytes - fill)
+                buf[fill : fill + take] = arr[pos : pos + take]
+                fill += take
+                pos += take
+                if fill == frame_bytes:
+                    frames.append(_fpz_encode_frame(f, block_start, buf, compressor))
+                    fill = 0
 
-        f.write(lo_bytes)
-        f.write(hi_z)
-        frames.append(
-            {
-                "payload_off": int(payload_off),
-                "lo_len": int(len(lo_bytes)),
-                "hi_len": int(len(hi_z)),
-                "n_out": int(n_out),
-            }
-        )
-        b += n_out
-
-    on_disk_len = f.tell() - block_start
-    return frames, on_disk_len
+    if fill > 0:
+        frames.append(_fpz_encode_frame(f, block_start, buf[:fill], compressor))
+    return frames
 
 
-def _write_fpz_pack(
-    source: np.ndarray,
+def _write_fpz_pack_streaming(
+    state_dict: dict[str, torch.Tensor],
     macroblocks: list[MacroblockPlan],
     index: list[TensorIndexRecord],
     align_bytes: int,
     compress_flags: list[bool],
     destination_path: str,
     dest_dir: str,
+    silent: bool,
 ) -> None:
-    """Write a compressed (fpz) pack to ``destination_path`` atomically.
+    """Write a compressed (fpz) pack to ``destination_path`` atomically in a
+    single pass -- no uncompressed scratch file.
 
-    ``source`` is the flushed uint8 memmap holding the uncompressed payload;
-    each macroblock is read from it and either fpz-encoded (``compress_flags``)
-    or copied verbatim. Macroblock alignment mirrors the uncompressed planner
-    so non-compressed blocks land at the same relative boundaries.
+    Each macroblock's payload is produced on the fly from ``state_dict`` (same
+    dtype conversion and inter-tensor alignment as the uncompressed planner)
+    and either streamed through split-plane zstd frames (bf16 blocks, per
+    ``compress_flags``) or written verbatim. The footer/frame format is
+    byte-compatible with the read path.
     """
     zstandard = require_zstandard()
     # threads=-1 = one worker per core: a ~19GB high plane at single-threaded
@@ -478,6 +541,9 @@ def _write_fpz_pack(
 
     fd_tmp, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=".packtmp_")
     os.close(fd_tmp)
+    progress = None
+    if not silent:
+        progress = tqdm.tqdm(desc="Packing (fpz)", total=len(index))
     try:
         macroblock_records: list[dict] = []
         with open(tmp_path, "wb") as f:
@@ -492,26 +558,28 @@ def _write_fpz_pack(
                         f.write(b"\x00" * pad)
                 block_offset = f.tell()
 
-                src_bytes = source[
-                    block.offset_bytes : block.offset_bytes + block.length_bytes
-                ]
-
                 record = {
                     "dtype": dtype_to_string(block.dtype),
                     "offset_bytes": int(block_offset),
                     "length_elems": int(block.total_elems),
                 }
                 if compress_flags[block_id]:
-                    frames, on_disk_len = _fpz_encode_block_to_file(
-                        f, src_bytes, compressor
+                    frames = _fpz_stream_compress_block(
+                        f, block_offset, block, state_dict, compressor, progress
                     )
-                    record["length_bytes"] = int(on_disk_len)
+                    record["length_bytes"] = int(f.tell() - block_offset)
                     record["fpz"] = {
                         "codec": FPZ_CODEC_SPLITPLANE_V1,
                         "frames": frames,
                     }
                 else:
-                    f.write(src_bytes)
+                    for kind, data in _iter_block_uncompressed_chunks(
+                        block, state_dict, progress
+                    ):
+                        if kind == "zeros":
+                            _write_zeros(f, data)
+                        else:
+                            f.write(data)
                     record["length_bytes"] = int(block.length_bytes)
                 macroblock_records.append(record)
 
@@ -548,6 +616,8 @@ def _write_fpz_pack(
         os.replace(tmp_path, destination_path)
         tmp_path = None
     finally:
+        if progress is not None:
+            progress.close()
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)

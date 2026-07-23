@@ -44,6 +44,11 @@ def _uint16_view(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.uint16)
 
 
+def _raw_bytes(t: torch.Tensor) -> torch.Tensor:
+    # dtype-agnostic byte view for bit-exact (NaN-safe) comparison.
+    return t.contiguous().view(torch.uint8)
+
+
 def _pack(tmp_path, state_dict, name: str, **kwargs) -> str:
     path = str(tmp_path / name)
     kwargs.setdefault("target_dtype", None)
@@ -264,3 +269,98 @@ def test_interleave_byte_order_is_little_endian(tmp_path) -> None:
     raw = _uint16_view(w).numpy().view(np.uint8)
     expected = _uint16_view(values).numpy().view(np.uint8)
     assert np.array_equal(raw, expected)
+
+
+def test_streaming_decode_matches_uncompressed_pack(tmp_path) -> None:
+    # Equivalence: the streaming compressed pack decodes bit-for-bit identically
+    # to the plain uncompressed pack of the same mixed state dict. The odd sizes
+    # force intra-block alignment padding (a zero gap between bf16.a and bf16.b),
+    # exercising the streaming gap-fill against the memmap layout.
+    source = {
+        "bf16.a": torch.randn(301, 400).to(torch.bfloat16),
+        "bf16.b": torch.randn(51).to(torch.bfloat16),
+        "fp32.c": torch.randn(128, 64),
+    }
+    plain = _pack(tmp_path, source, "plain.flashpack")
+    comp = _pack(tmp_path, source, "comp.flashpack", compress="fpz-bf16")
+
+    sp, mp = read_flashpack_file(plain, device="cpu")
+    sc, mc = read_flashpack_file(comp, device="cpu")
+    plain_tensors = dict(iterate_from_flash_tensor(sp, mp))
+    comp_tensors = dict(iterate_from_flash_tensor(sc, mc))
+    assert set(plain_tensors) == set(comp_tensors) == set(source)
+    for name in source:
+        assert torch.equal(
+            _raw_bytes(plain_tensors[name]), _raw_bytes(comp_tensors[name])
+        )
+        assert torch.equal(_raw_bytes(comp_tensors[name]), _raw_bytes(source[name]))
+
+
+def test_streaming_creates_no_uncompressed_scratch(tmp_path, monkeypatch) -> None:
+    # The whole point of streaming: never materialize the uncompressed payload.
+    # Prove it two ways -- np.memmap (the only uncompressed-scratch allocator in
+    # the write path) is never called, and exactly ONE tempfile is created (the
+    # final compressed pack), not a scratch + final pair like the old post-pass.
+    import flashpack.serialization as serialization
+
+    # Small frames so the rolling-buffer multi-frame path runs under the guards.
+    monkeypatch.setattr(
+        serialization, "FPZ_FRAME_UNCOMPRESSED_BYTES", 1 << 16, raising=True
+    )
+
+    def no_memmap(*args, **kwargs):
+        raise AssertionError("uncompressed scratch memmap must not be created")
+
+    monkeypatch.setattr(serialization.np, "memmap", no_memmap)
+
+    tempfiles: list[str] = []
+    real_mkstemp = serialization.tempfile.mkstemp
+
+    def counting_mkstemp(*args, **kwargs):
+        result = real_mkstemp(*args, **kwargs)
+        tempfiles.append(result[1])
+        return result
+
+    monkeypatch.setattr(serialization.tempfile, "mkstemp", counting_mkstemp)
+
+    ramp = (torch.arange(1 << 18, dtype=torch.float32) * 0.001).to(torch.bfloat16)
+    comp = str(tmp_path / "comp.flashpack")
+    pack_to_file({"w": ramp}, comp, target_dtype=None, compress="fpz-bf16")
+
+    assert len(tempfiles) == 1  # only the final compressed pack, no scratch
+    frames = get_flashpack_file_metadata(comp)["macroblocks"][0]["fpz"]["frames"]
+    assert len(frames) >= 2  # multi-frame rolling-buffer path exercised
+
+    storage, meta = read_flashpack_file(comp, device="cpu")
+    (w,) = [t for _, t in iterate_from_flash_tensor(storage, meta)]
+    assert torch.equal(_uint16_view(w), _uint16_view(ramp))
+
+
+def test_streaming_gap_straddling_frame_boundary(tmp_path, monkeypatch) -> None:
+    # Two bf16 tensors with alignment padding between them, and a frame step
+    # small enough that the zero gap straddles a frame cut -- the case where
+    # the rolling buffer must carry a partial gap across the flush boundary.
+    import flashpack.serialization as serialization
+
+    monkeypatch.setattr(serialization, "FPZ_FRAME_UNCOMPRESSED_BYTES", 64, raising=True)
+    source = {
+        "a": torch.randn(40).to(torch.bfloat16),
+        "b": torch.randn(40).to(torch.bfloat16),
+    }
+    plain = _pack(tmp_path, source, "plain.flashpack", align_bytes=128)
+    comp = _pack(
+        tmp_path, source, "comp.flashpack", align_bytes=128, compress="fpz-bf16"
+    )
+
+    frames = get_flashpack_file_metadata(comp)["macroblocks"][0]["fpz"]["frames"]
+    assert len(frames) >= 2
+
+    sp, mp = read_flashpack_file(plain, device="cpu")
+    sc, mc = read_flashpack_file(comp, device="cpu")
+    plain_tensors = dict(iterate_from_flash_tensor(sp, mp))
+    comp_tensors = dict(iterate_from_flash_tensor(sc, mc))
+    for name in source:
+        assert torch.equal(
+            _raw_bytes(plain_tensors[name]), _raw_bytes(comp_tensors[name])
+        )
+        assert torch.equal(_raw_bytes(comp_tensors[name]), _raw_bytes(source[name]))
