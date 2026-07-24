@@ -31,6 +31,7 @@ from .parallel_read import (
     parallel_read_supported,
 )
 from .utils import (
+    effective_read_threads,
     get_module_and_attribute,
     get_packing_dtype,
     human_num_elements,
@@ -466,7 +467,7 @@ def _fpz_read_into_cpu_storage(
     (default 16) instead of running serially as it did before.
     """
     zstandard = require_zstandard()
-    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+    n_threads = effective_read_threads(_env_int("FLASHPACK_READ_THREADS", 16))
 
     dst_u8 = [b.view(torch.uint8).numpy() for b in blocks]
     tasks = _fpz_frame_tasks(specs)
@@ -555,7 +556,7 @@ def _fpz_read_into_cuda_storage(
     by the CPU tests via the shared ``_fpz_read_frame_planes`` helper.
     """
     zstandard = require_zstandard()
-    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+    n_threads = effective_read_threads(_env_int("FLASHPACK_READ_THREADS", 16))
     half_cap = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
     n_slots = _FPZ_CUDA_BUFFERS_PER_THREAD
 
@@ -875,6 +876,63 @@ def _install_torch_nvcomp_allocator(nvcomp, device: torch.device) -> bool:
     return True
 
 
+def fpz_gpu_warmup(device: "str | torch.device" = "cuda") -> bool:
+    """Pay the batched GPU decoder's one-time init cost off the hot path.
+
+    The first ``nvcompBatchedZstdDecompressAsync`` launch in a process pays
+    CUDA module loading for nvcomp's decompress kernels (measured 4-25s on
+    H200 under default lazy loading; ~1.6s residual with
+    ``CUDA_MODULE_LOADING=EAGER`` set before the first CUDA call, which is
+    the recommended companion setting). Apps can call this from ``setup()``
+    -- e.g. while weights download -- so the first real load doesn't pay it.
+
+    Decodes one tiny zstd chunk through the batched path end to end. Safe
+    no-op returning ``False`` when CUDA, libnvcomp, or zstandard is
+    unavailable; returns ``True`` only when the warmup decode round-tripped.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return False
+        from . import _nvcomp_ll
+
+        ll = _nvcomp_ll.load()
+        if ll is None:
+            return False
+        zstandard = require_zstandard()
+        dev = torch.device(device)
+        usize = 4096
+        payload = zstandard.ZstdCompressor(level=1).compress(b"\x00" * usize)
+        src = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(dev)
+        dst = torch.empty(usize, dtype=torch.uint8, device=dev)
+        # Single-chunk device tables: [src ptr, src len, dst capacity, dst ptr]
+        tab = torch.tensor(
+            [src.data_ptr(), len(payload), usize, dst.data_ptr()],
+            dtype=torch.int64,
+            device=dev,
+        )
+        actual = torch.zeros(1, dtype=torch.int64, device=dev)
+        statuses = torch.full((1,), -1, dtype=torch.int32, device=dev)
+        temp_bytes = ll.temp_size(1, usize, usize)
+        temp = torch.empty(max(1, temp_bytes), dtype=torch.uint8, device=dev)
+        stream = torch.cuda.current_stream(dev)
+        ll.decompress_async(
+            tab[0:1].data_ptr(),
+            tab[1:2].data_ptr(),
+            tab[2:3].data_ptr(),
+            actual.data_ptr(),
+            1,
+            temp.data_ptr(),
+            temp_bytes,
+            tab[3:4].data_ptr(),
+            statuses.data_ptr(),
+            stream.cuda_stream,
+        )
+        stream.synchronize()
+        return int(statuses.item()) == 0 and int(actual.item()) == usize
+    except Exception:
+        return False
+
+
 # GPU-decode tuning knobs (env-overridable).
 #
 # Pipeline math (why these defaults). With v2 the GPU decode is fast and
@@ -1052,8 +1110,8 @@ def _fpz_read_into_cuda_storage_gpu(
                 )
                 ll = None
 
-    n_threads = max(
-        1, _env_int("FLASHPACK_FPZ_GPU_DECODE_THREADS", _FPZ_GPU_DEFAULT_THREADS)
+    n_threads = effective_read_threads(
+        _env_int("FLASHPACK_FPZ_GPU_DECODE_THREADS", _FPZ_GPU_DEFAULT_THREADS)
     )
     batch_frames = max(
         1, _env_int("FLASHPACK_FPZ_GPU_BATCH_FRAMES", _FPZ_GPU_DEFAULT_BATCH_FRAMES)

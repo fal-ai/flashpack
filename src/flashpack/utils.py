@@ -59,6 +59,31 @@ def maybe_init_distributed(
         torch.cuda.set_device(torch.device(f"cuda:{local_rank}"))
 
 
+def effective_read_threads(requested: int) -> int:
+    """Clamp a reader-thread request to the CPUs this process may run on.
+
+    Reader threads do GIL-releasing pread/decode/memcpy work; running more of
+    them than the process's CPU affinity allows never helps and measurably
+    hurts (oversubscription, and on the GPU paths each thread owns a CUDA
+    stream -- co-located stream counts in the dozens are stream-collapse
+    territory). Prod runners execute in dedicated cpusets, so the affinity
+    mask -- not ``os.cpu_count()`` -- is the real budget. Escape hatch:
+    ``FLASHPACK_NO_THREAD_CLAMP=1`` restores the unclamped request.
+    """
+    if os.environ.get("FLASHPACK_NO_THREAD_CLAMP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return max(1, requested)
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # non-Linux
+        cpus = os.cpu_count() or requested
+    return max(1, min(requested, cpus))
+
+
 def get_module_and_attribute(
     model: torch.nn.Module,
     name: str,
