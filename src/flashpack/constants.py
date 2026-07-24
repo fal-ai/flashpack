@@ -34,4 +34,13 @@ FPZ_FRAME_ALIGN_BYTES = 4096
 # uncomp_chunk_size (65536) and divides the 32 MiB half-frame evenly (512
 # chunks), so full frames have no odd-sized tail chunk.
 FPZ_HI_CHUNK_UNCOMPRESSED_BYTES = 64 * 1024
+# Byte alignment of each v2 compressed chunk's START within the frame payload
+# (chunks are padded to this; "hi_chunks" still records true zstd lengths and
+# the reader recomputes padded offsets from the block's "hi_align" footer
+# field, absent = 1 for pre-alignment packs). 16 covers nvcomp's batched
+# decompressor input-alignment requirement -- its C API rejects unaligned
+# device chunk pointers with nvcompErrorAlignment, and the reference callers
+# align inputs to max(16, queried requirement). Cost: <= 15 pad bytes per
+# chunk (~0.001% at 1 MiB chunks).
+FPZ_HI_CHUNK_ALIGN_BYTES = 16
 DEFAULT_ZSTD_LEVEL = 3

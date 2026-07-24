@@ -19,6 +19,7 @@ from .constants import (
     FPZ_COMPRESS_BF16,
     FPZ_FRAME_ALIGN_BYTES,
     FPZ_FRAME_UNCOMPRESSED_BYTES,
+    FPZ_HI_CHUNK_ALIGN_BYTES,
     FPZ_HI_CHUNK_UNCOMPRESSED_BYTES,
     MAGIC,
     U64LE,
@@ -543,10 +544,22 @@ def _fpz_encode_frame_v2(
         payload_off += pad
 
     f.write(lo_bytes)
+    # Pad after the lo plane and after every chunk so each chunk STARTS
+    # hi_align-aligned within the (FPZ_FRAME_ALIGN_BYTES-aligned) payload:
+    # batched GPU decode requires aligned device chunk pointers. A full
+    # frame's lo plane (32 MiB) is already aligned, but the tail frame's
+    # arbitrary half-length is not. "hi_chunks" records TRUE zstd lengths;
+    # the reader recomputes padded offsets from the footer's "hi_align".
+    pad = (-len(lo_bytes)) % FPZ_HI_CHUNK_ALIGN_BYTES
+    if pad:
+        f.write(b"\x00" * pad)
     hi_chunks: list[int] = []
     for z in hi_z_chunks:
         f.write(z)
         hi_chunks.append(int(len(z)))
+        pad = (-len(z)) % FPZ_HI_CHUNK_ALIGN_BYTES
+        if pad:
+            f.write(b"\x00" * pad)
     return {
         "payload_off": int(payload_off),
         "lo_len": int(len(lo_bytes)),
@@ -682,8 +695,11 @@ def _write_fpz_pack_streaming(
                     fpz_record: dict = {"codec": codec_name, "frames": frames}
                     if version == 2:
                         # Record the chunk size so the reader reproduces the
-                        # chunking regardless of the current default.
+                        # chunking regardless of the current default, and the
+                        # chunk-start alignment so it can recompute the padded
+                        # offsets (absent = 1: pre-alignment packed layout).
                         fpz_record["hi_chunk_usize"] = int(hi_chunk_bytes)
+                        fpz_record["hi_align"] = FPZ_HI_CHUNK_ALIGN_BYTES
                     record["fpz"] = fpz_record
                 else:
                     for kind, data in _iter_block_uncompressed_chunks(
