@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import tqdm
 
+from . import _interleave
 from .constants import (
     DEFAULT_CHUNK_BYTES,
     DEFAULT_NUM_STREAMS,
@@ -334,8 +335,17 @@ def _allocate_aligned_cpu_storage(specs: list[MacroblockSpec]) -> FlashTensorSto
 
 
 def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
+    """Broadcast every macroblock from ``src`` to all ranks, as raw bytes.
+
+    Blocks are broadcast through a ``uint8`` view rather than their native
+    dtype: the collective only moves bits, and torch's NCCL dtype map does
+    not cover every dtype flashpack stores (``float8_e8m0fnu`` -- the mxfp8
+    scale dtype -- is absent, so a native-dtype broadcast of an mxfp8 pack
+    crashes; gloo similarly lacks the float8 family). The byte view is
+    dtype-agnostic and free (no copy).
+    """
     for block in storage.blocks:
-        dist.broadcast(block, src=src)
+        dist.broadcast(block.view(torch.uint8), src=src)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -559,6 +569,9 @@ def _fpz_read_into_cuda_storage(
     n_threads = effective_read_threads(_env_int("FLASHPACK_READ_THREADS", 16))
     half_cap = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
     n_slots = _FPZ_CUDA_BUFFERS_PER_THREAD
+    fused = _env_flag("FLASHPACK_FPZ_FUSED_INTERLEAVE") and (
+        _interleave.fused_interleave_available()
+    )
 
     byte_blocks = [b.view(torch.uint8) for b in blocks]
 
@@ -651,8 +664,13 @@ def _fpz_read_into_cuda_storage(
                         hi_dev[slot][:half].copy_(
                             hi_pin[slot][:half], non_blocking=True
                         )
-                        seg[0::2].copy_(lo_dev[slot][:half], non_blocking=True)
-                        seg[1::2].copy_(hi_dev[slot][:half], non_blocking=True)
+                        if fused:
+                            _interleave.interleave_into(
+                                seg, lo_dev[slot][:half], hi_dev[slot][:half]
+                            )
+                        else:
+                            seg[0::2].copy_(lo_dev[slot][:half], non_blocking=True)
+                            seg[1::2].copy_(hi_dev[slot][:half], non_blocking=True)
                         events[slot].record(stream)
             finally:
                 os.close(fd)
@@ -1091,6 +1109,12 @@ def _fpz_read_into_cuda_storage_gpu(
     # device-resident chunk tables instead of one pybind Array per chunk.
     # Requires the pack's chunk starts to satisfy nvcomp's queried input
     # alignment (hi_align-padded packs do; legacy packed layouts fall back).
+    # Fused single-pass interleave (Triton) vs the strided two-pass copies;
+    # opt-in while gating, falls back automatically when triton is missing.
+    fused = _env_flag("FLASHPACK_FPZ_FUSED_INTERLEAVE") and (
+        _interleave.fused_interleave_available()
+    )
+
     ll = None
     if _env_flag("FLASHPACK_FPZ_GPU_LL"):
         from . import _nvcomp_ll
@@ -1457,22 +1481,30 @@ def _fpz_read_into_cuda_storage_gpu(
                     if trace_on:
                         t_decode += time.perf_counter() - _t
 
-                    # Strided interleave per frame (same invariant as the CPU
-                    # path): even bytes low plane, odd bytes high plane.
+                    # Interleave per frame (same invariant as the CPU path):
+                    # even bytes low plane, odd bytes high plane. Fused = one
+                    # kernel pass; strided = two 2-byte-stride copy passes.
                     _t = time.perf_counter() if trace_on else 0.0
                     for k, (_, blk, frame, out_pos) in enumerate(batch):
                         half = halves[k]
                         n_out = int(frame["n_out"])
                         seg = byte_blocks[blk].narrow(0, out_pos, n_out)
                         with torch.cuda.stream(stream):
-                            seg[0::2].copy_(
-                                lo_dev[slot].narrow(0, k * half_cap, half),
-                                non_blocking=True,
-                            )
-                            seg[1::2].copy_(
-                                hi_dev[slot].narrow(0, k * half_cap, half),
-                                non_blocking=True,
-                            )
+                            if fused:
+                                _interleave.interleave_into(
+                                    seg,
+                                    lo_dev[slot].narrow(0, k * half_cap, half),
+                                    hi_dev[slot].narrow(0, k * half_cap, half),
+                                )
+                            else:
+                                seg[0::2].copy_(
+                                    lo_dev[slot].narrow(0, k * half_cap, half),
+                                    non_blocking=True,
+                                )
+                                seg[1::2].copy_(
+                                    hi_dev[slot].narrow(0, k * half_cap, half),
+                                    non_blocking=True,
+                                )
                     events[slot].record(stream)
                     if trace_on:
                         t_interleave += time.perf_counter() - _t
@@ -1778,6 +1810,14 @@ def assign_from_file(
             world_size=world_size,
         )
         rank = dist.get_rank()
+        if dist.get_backend() == "nccl" and device.type != "cuda":
+            # NCCL cannot broadcast host tensors; a CPU-device distributed
+            # load would fail deep inside the collective with an opaque
+            # error, so fail clearly here instead.
+            raise ValueError(
+                "use_distributed_loading with the NCCL backend requires a "
+                f"cuda device, got {device}."
+            )
         meta = get_flashpack_file_metadata(path)
         specs = _build_macroblock_specs(meta)
         if rank == 0:
