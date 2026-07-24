@@ -17,6 +17,7 @@ works through the uint8 view.
 import os
 import sys
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -24,6 +25,8 @@ from flashpack.deserialization import (
     FlashTensorStorage,
     _broadcast_storage,
     assign_from_file,
+    iterate_from_flash_tensor,
+    read_flashpack_file_distributed,
 )
 from flashpack.serialization import pack_to_file
 
@@ -117,3 +120,35 @@ def test_assign_from_file_distributed_end_to_end(tmp_path) -> None:
         nprocs=_WORLD,
         join=True,
     )
+
+
+def _read_dist_worker(rank: int, init_file: str, pack_path: str) -> None:
+    _init(rank, init_file)
+    try:
+        storage, meta = read_flashpack_file_distributed(pack_path, device="cpu")
+        got = dict(iterate_from_flash_tensor(storage, meta))
+        state = _source_state()
+        assert set(got) == set(state)
+        for name, tensor in state.items():
+            assert torch.equal(got[name], tensor), f"rank {rank} {name} mismatch"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_read_flashpack_file_distributed(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_source_state(), pack, None)
+    mp.spawn(
+        _read_dist_worker,
+        args=(str(tmp_path / "rdv3"), pack),
+        nprocs=_WORLD,
+        join=True,
+    )
+
+
+def test_read_distributed_requires_process_group(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_source_state(), pack, None)
+    assert not dist.is_initialized()
+    with pytest.raises(RuntimeError, match="process group"):
+        read_flashpack_file_distributed(pack, device="cpu")
