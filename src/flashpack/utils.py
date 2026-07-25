@@ -59,6 +59,31 @@ def maybe_init_distributed(
         torch.cuda.set_device(torch.device(f"cuda:{local_rank}"))
 
 
+def effective_read_threads(requested: int) -> int:
+    """Clamp a reader-thread request to the CPUs this process may run on.
+
+    Reader threads do GIL-releasing pread/decode/memcpy work; running more of
+    them than the process's CPU affinity allows never helps and measurably
+    hurts (oversubscription, and on the GPU paths each thread owns a CUDA
+    stream -- co-located stream counts in the dozens are stream-collapse
+    territory). Prod runners execute in dedicated cpusets, so the affinity
+    mask -- not ``os.cpu_count()`` -- is the real budget. Escape hatch:
+    ``FLASHPACK_NO_THREAD_CLAMP=1`` restores the unclamped request.
+    """
+    if os.environ.get("FLASHPACK_NO_THREAD_CLAMP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return max(1, requested)
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # non-Linux
+        cpus = os.cpu_count() or requested
+    return max(1, min(requested, cpus))
+
+
 def get_module_and_attribute(
     model: torch.nn.Module,
     name: str,
@@ -73,6 +98,23 @@ def get_module_and_attribute(
         raise ValueError(f"Module not found: {module_path}")
 
     return module, name
+
+
+def require_zstandard():
+    """Import the optional ``zstandard`` dependency for fpz compression.
+
+    zstandard is not a hard dependency of flashpack; it is only needed to
+    write or read fpz-compressed packs. Install it with ``pip install
+    'flashpack[fpz]'`` (see the ``fpz`` extra in ``pyproject.toml``).
+    """
+    try:
+        import zstandard
+    except ImportError as e:  # pragma: no cover - exercised via message only
+        raise ImportError(
+            "fpz compression requires the optional 'zstandard' package. "
+            "Install it with: pip install 'flashpack[fpz]'"
+        ) from e
+    return zstandard
 
 
 def string_to_dtype(string: str) -> torch.dtype:

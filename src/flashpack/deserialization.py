@@ -305,8 +305,17 @@ def _allocate_aligned_cpu_storage(specs: list[MacroblockSpec]) -> FlashTensorSto
 
 
 def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
+    """Broadcast every macroblock from ``src`` to all ranks, as raw bytes.
+
+    Blocks are broadcast through a ``uint8`` view rather than their native
+    dtype: the collective only moves bits, and torch's NCCL dtype map does
+    not cover every dtype flashpack stores (``float8_e8m0fnu`` -- the mxfp8
+    scale dtype -- is absent, so a native-dtype broadcast of an mxfp8 pack
+    crashes; gloo similarly lacks the float8 family). The byte view is
+    dtype-agnostic and free (no copy).
+    """
     for block in storage.blocks:
-        dist.broadcast(block, src=src)
+        dist.broadcast(block.view(torch.uint8), src=src)
 
 
 def read_flashpack_file(
@@ -367,6 +376,57 @@ def read_flashpack_file(
         )
 
     del memmaps
+    return storage, meta
+
+
+def read_flashpack_file_distributed(
+    path: str,
+    device: str | torch.device = "cuda",
+    src: int = 0,
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    num_streams: int = DEFAULT_NUM_STREAMS,
+    silent: bool = True,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[FlashTensorStorage, dict[str, Any]]:
+    """Rank-``src`` reads the pack from disk; every rank returns the full
+    storage, received via broadcast.
+
+    This removes the N-times read amplification of world-size-N loads: the
+    reader deliberately bypasses the page cache (O_DIRECT), so without this
+    every rank pays a full duplicate pack read, while an NVLink broadcast of
+    the same bytes is 1-2 orders of magnitude faster than the read itself.
+
+    Requires an initialized process group (see ``maybe_init_distributed``).
+    Every rank must be able to read the pack FOOTER from ``path`` (payload
+    is only read on ``src``); pass ``metadata`` to skip that requirement.
+    Blocks are broadcast as raw bytes, so any pack dtype works regardless of
+    the collective backend's dtype support.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "read_flashpack_file_distributed requires an initialized "
+            "torch.distributed process group."
+        )
+    device = torch.device(device) if isinstance(device, str) else device
+    if dist.get_backend() == "nccl" and device.type != "cuda":
+        raise ValueError(
+            "distributed flashpack loading with the NCCL backend requires "
+            f"a cuda device, got {device}."
+        )
+    meta = metadata or get_flashpack_file_metadata(path)
+    if dist.get_rank() == src:
+        storage, meta = read_flashpack_file(
+            path=path,
+            device=device,
+            chunk_bytes=chunk_bytes,
+            num_streams=num_streams,
+            silent=silent,
+            metadata=meta,
+        )
+    else:
+        specs = _build_macroblock_specs(meta)
+        storage = _allocate_empty_storage(specs, device)
+    _broadcast_storage(storage, src=src)
     return storage, meta
 
 
@@ -500,21 +560,13 @@ def assign_from_file(
             local_rank=local_rank,
             world_size=world_size,
         )
-        rank = dist.get_rank()
-        meta = get_flashpack_file_metadata(path)
-        specs = _build_macroblock_specs(meta)
-        if rank == 0:
-            flash_storage, meta = read_flashpack_file(
-                path=path,
-                device=device,
-                silent=silent,
-                num_streams=num_streams,
-                chunk_bytes=chunk_bytes,
-                metadata=meta,
-            )
-        else:
-            flash_storage = _allocate_empty_storage(specs, device)
-        _broadcast_storage(flash_storage, src=0)
+        flash_storage, meta = read_flashpack_file_distributed(
+            path=path,
+            device=device,
+            silent=silent,
+            num_streams=num_streams,
+            chunk_bytes=chunk_bytes,
+        )
     else:
         flash_storage, meta = read_flashpack_file(
             path=path,
