@@ -11,12 +11,26 @@ import tqdm
 from .constants import (
     DEFAULT_ALIGN_BYTES,
     DEFAULT_NUM_WRITE_WORKERS,
+    DEFAULT_ZSTD_LEVEL,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
+    FPZ_CODEC_SPLITPLANE_V1,
+    FPZ_CODEC_SPLITPLANE_V2,
+    FPZ_COMPRESS_BF16,
+    FPZ_FRAME_ALIGN_BYTES,
+    FPZ_FRAME_UNCOMPRESSED_BYTES,
+    FPZ_HI_CHUNK_ALIGN_BYTES,
+    FPZ_HI_CHUNK_UNCOMPRESSED_BYTES,
     MAGIC,
     U64LE,
 )
-from .utils import dtype_to_string, get_packing_dtype, timer, torch_dtype_to_numpy_dtype
+from .utils import (
+    dtype_to_string,
+    get_packing_dtype,
+    require_zstandard,
+    timer,
+    torch_dtype_to_numpy_dtype,
+)
 
 
 @dataclass
@@ -38,6 +52,35 @@ class MacroblockPlan:
     tensors: list[TensorIndexRecord]
 
 
+def _resolve_hi_chunk_bytes(hi_chunk_bytes: int | None) -> int:
+    """Resolve and validate the v2 high-plane chunk size.
+
+    Precedence: explicit ``hi_chunk_bytes`` arg > ``FLASHPACK_FPZ_CHUNK_BYTES``
+    env (for the converter) > ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES`` default. An
+    explicitly requested value must be a positive multiple of
+    ``FPZ_FRAME_ALIGN_BYTES`` and no larger than a frame's high plane
+    (``FPZ_FRAME_UNCOMPRESSED_BYTES // 2``). The default is clamped to the frame
+    high plane rather than rejected (a chunk >= the high plane just yields one
+    chunk per frame -- the case tests hit by shrinking the frame size).
+    """
+    half_frame = FPZ_FRAME_UNCOMPRESSED_BYTES // 2
+    env = os.environ.get("FLASHPACK_FPZ_CHUNK_BYTES")
+    if hi_chunk_bytes is None and not env:
+        return max(1, min(FPZ_HI_CHUNK_UNCOMPRESSED_BYTES, half_frame))
+    requested = hi_chunk_bytes if hi_chunk_bytes is not None else int(env)
+    if requested < FPZ_FRAME_ALIGN_BYTES or requested % FPZ_FRAME_ALIGN_BYTES:
+        raise ValueError(
+            f"hi_chunk_bytes must be a positive multiple of "
+            f"{FPZ_FRAME_ALIGN_BYTES} (got {requested})"
+        )
+    if requested > half_frame:
+        raise ValueError(
+            f"hi_chunk_bytes ({requested}) exceeds the frame high-plane "
+            f"size ({half_frame})"
+        )
+    return requested
+
+
 def pack_to_file(
     state_dict_or_model: dict[str, torch.Tensor] | torch.nn.Module,
     destination_path: str,
@@ -46,10 +89,27 @@ def pack_to_file(
     align_bytes: int = DEFAULT_ALIGN_BYTES,
     silent: bool = True,
     num_workers: int = DEFAULT_NUM_WRITE_WORKERS,
+    compress: str | None = None,
+    hi_chunk_bytes: int | None = None,
 ) -> None:
     """
     Pack the state dictionary or model to a flashpack file.
+
+    ``compress="fpz-bf16"`` enables split-plane zstd compression for bf16
+    macroblocks only (see ``constants.py``); every other dtype is stored
+    uncompressed, and the file falls back to the plain uncompressed format
+    when no bf16 macroblock is present. Requires the optional ``zstandard``
+    package. ``hi_chunk_bytes`` overrides the v2 high-plane chunk size (default
+    ``FPZ_HI_CHUNK_UNCOMPRESSED_BYTES``, or ``FLASHPACK_FPZ_CHUNK_BYTES``);
+    larger chunks mean fewer per-chunk wrapper objects for the GPU decoder.
     """
+    if compress is not None and compress != FPZ_COMPRESS_BF16:
+        raise ValueError(
+            f"Unsupported compress option: {compress!r} "
+            f"(expected None or {FPZ_COMPRESS_BF16!r})"
+        )
+    resolved_hi_chunk_bytes = _resolve_hi_chunk_bytes(hi_chunk_bytes)
+
     if isinstance(state_dict_or_model, torch.nn.Module):
         state_dict = state_dict_or_model.state_dict()
     else:
@@ -154,6 +214,32 @@ def pack_to_file(
 
     dest_dir = os.path.dirname(os.path.abspath(destination_path)) or "."
     os.makedirs(dest_dir, exist_ok=True)
+
+    # fpz path: bf16 macroblocks are split-plane zstd-compressed, every other
+    # dtype is stored verbatim. When no block is eligible the file is identical
+    # to the uncompressed pack, so fall through to the plain path below.
+    compress_flags = [
+        compress == FPZ_COMPRESS_BF16 and block.dtype is torch.bfloat16
+        for block in macroblocks
+    ]
+    if any(compress_flags):
+        # Single pass, no uncompressed scratch: convert each tensor to CPU
+        # bytes and stream them through a rolling frame buffer directly into
+        # the final compressed file.
+        with timer("fpz_stream_write", silent):
+            _write_fpz_pack_streaming(
+                state_dict=state_dict,
+                macroblocks=macroblocks,
+                index=index,
+                align_bytes=align_bytes,
+                compress_flags=compress_flags,
+                destination_path=destination_path,
+                dest_dir=dest_dir,
+                silent=silent,
+                hi_chunk_bytes=resolved_hi_chunk_bytes,
+            )
+        return
+
     fd_tmp = None
     tmp_path = None
 
@@ -340,6 +426,327 @@ def pack_to_file(
 
     finally:
         # Cleanup on error
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _write_zeros(f, n: int) -> None:
+    """Write ``n`` zero bytes to ``f`` in bounded chunks."""
+    while n > 0:
+        take = min(n, 1 << 20)
+        f.write(b"\x00" * take)
+        n -= take
+
+
+def _iter_block_uncompressed_chunks(
+    block: MacroblockPlan,
+    state_dict: dict[str, torch.Tensor],
+    progress: "tqdm.tqdm | None" = None,
+):
+    """Yield a macroblock's uncompressed payload in order, reproducing the
+    memmap layout exactly.
+
+    Emits ``("zeros", nbytes)`` for the inter-tensor element-alignment gaps
+    (zero-filled, as a fresh memmap is) and ``("bytes", uint8_ndarray)`` for
+    each tensor -- the target-dtype CPU reinterpretation (packing view) that
+    the uncompressed copy loop writes. ``.to(device="cpu")`` handles the D2H
+    transfer for GPU-source tensors.
+    """
+    elem_size = torch.tensor([], dtype=block.dtype).element_size()
+    packing_dtype = get_packing_dtype(block.dtype)
+    cursor_elems = 0
+    for rec in block.tensors:
+        if rec.offset > cursor_elems:
+            yield ("zeros", (rec.offset - cursor_elems) * elem_size)
+            cursor_elems = rec.offset
+        src = state_dict[rec.name]
+        src_cpu = src.view(-1).to(dtype=block.dtype, device="cpu")
+        if block.dtype != packing_dtype:
+            src_cpu = src_cpu.view(packing_dtype)
+        raw = src_cpu.contiguous().view(torch.uint8).numpy()
+        yield ("bytes", raw)
+        cursor_elems += rec.length
+        if progress is not None:
+            progress.update(1)
+    if block.total_elems > cursor_elems:
+        yield ("zeros", (block.total_elems - cursor_elems) * elem_size)
+
+
+def _fpz_encode_frame(f, block_start: int, frame_u8: np.ndarray, compressor) -> dict:
+    """Encode one split-plane zstd frame from ``frame_u8`` (the uncompressed
+    bytes of a single frame) and write it to ``f``.
+
+    bf16 elements are little-endian, so even bytes are the low (mantissa-LSB)
+    plane -- kept raw -- and odd bytes are the high (sign+exponent) plane --
+    zstd-compressed. The frame payload start is padded to a 4096-byte boundary
+    relative to the macroblock start.
+    """
+    n_out = int(frame_u8.shape[0])
+    lo = np.ascontiguousarray(frame_u8[0::2])
+    hi = np.ascontiguousarray(frame_u8[1::2])
+    lo_bytes = lo.tobytes()
+    hi_z = compressor.compress(hi.tobytes())
+
+    payload_off = f.tell() - block_start
+    pad = (-payload_off) % FPZ_FRAME_ALIGN_BYTES
+    if pad:
+        f.write(b"\x00" * pad)
+        payload_off += pad
+
+    f.write(lo_bytes)
+    f.write(hi_z)
+    return {
+        "payload_off": int(payload_off),
+        "lo_len": int(len(lo_bytes)),
+        "hi_len": int(len(hi_z)),
+        "n_out": int(n_out),
+    }
+
+
+# Default fpz codec version written by the streaming encoder. v2 (chunked high
+# plane) is the GPU-decodable format; tests set this to 1 to exercise the
+# v1-still-reads backward-compatibility path.
+_DEFAULT_FPZ_VERSION = 2
+
+
+def _fpz_encode_frame_v2(
+    f, block_start: int, frame_u8: np.ndarray, chunk_compressor, chunk: int
+) -> dict:
+    """Encode one split-plane frame with a CHUNKED high plane (codec v2).
+
+    Same low/high split as v1, but the high plane is compressed as a sequence of
+    independent zstd frames of ``chunk`` uncompressed bytes each (the frame's
+    last chunk holds the remainder). Many small chunks are what a GPU decoder
+    needs to decompress in parallel; the frame record lists each chunk's
+    compressed length so the reader locates them by prefix sum. Larger chunks
+    mean fewer per-chunk wrapper objects for the GPU decoder to build (the read
+    bottleneck once decode is parallel) at the cost of slightly less parallelism
+    and a hair less ratio. Ratio drops slightly versus v1 because each chunk
+    compresses without the neighbouring chunks' context.
+    """
+    n_out = int(frame_u8.shape[0])
+    lo = np.ascontiguousarray(frame_u8[0::2])
+    hi = np.ascontiguousarray(frame_u8[1::2])
+    lo_bytes = lo.tobytes()
+    half = int(hi.shape[0])
+    hi_z_chunks = [
+        chunk_compressor.compress(hi[off : off + chunk].tobytes())
+        for off in range(0, half, chunk)
+    ]
+
+    payload_off = f.tell() - block_start
+    pad = (-payload_off) % FPZ_FRAME_ALIGN_BYTES
+    if pad:
+        f.write(b"\x00" * pad)
+        payload_off += pad
+
+    f.write(lo_bytes)
+    # Pad after the lo plane and after every chunk so each chunk STARTS
+    # hi_align-aligned within the (FPZ_FRAME_ALIGN_BYTES-aligned) payload:
+    # batched GPU decode requires aligned device chunk pointers. A full
+    # frame's lo plane (32 MiB) is already aligned, but the tail frame's
+    # arbitrary half-length is not. "hi_chunks" records TRUE zstd lengths;
+    # the reader recomputes padded offsets from the footer's "hi_align".
+    pad = (-len(lo_bytes)) % FPZ_HI_CHUNK_ALIGN_BYTES
+    if pad:
+        f.write(b"\x00" * pad)
+    hi_chunks: list[int] = []
+    for z in hi_z_chunks:
+        f.write(z)
+        hi_chunks.append(int(len(z)))
+        pad = (-len(z)) % FPZ_HI_CHUNK_ALIGN_BYTES
+        if pad:
+            f.write(b"\x00" * pad)
+    return {
+        "payload_off": int(payload_off),
+        "lo_len": int(len(lo_bytes)),
+        "n_out": int(n_out),
+        "hi_chunks": hi_chunks,
+    }
+
+
+def _fpz_stream_compress_block(
+    f,
+    block_start: int,
+    block: MacroblockPlan,
+    state_dict: dict[str, torch.Tensor],
+    encode_frame,
+    progress: "tqdm.tqdm | None",
+) -> list[dict]:
+    """Stream one bf16 macroblock through a rolling ``FPZ_FRAME_UNCOMPRESSED_BYTES``
+    buffer, emitting a split-plane frame (via ``encode_frame``) each time it
+    fills (and once more for the tail). Peak extra memory is one frame buffer
+    plus one source tensor."""
+    frame_bytes = FPZ_FRAME_UNCOMPRESSED_BYTES
+    buf = np.empty(frame_bytes, dtype=np.uint8)
+    fill = 0
+    frames: list[dict] = []
+
+    for kind, data in _iter_block_uncompressed_chunks(block, state_dict, progress):
+        if kind == "zeros":
+            remaining = data
+            while remaining > 0:
+                take = min(remaining, frame_bytes - fill)
+                buf[fill : fill + take] = 0
+                fill += take
+                remaining -= take
+                if fill == frame_bytes:
+                    frames.append(encode_frame(f, block_start, buf))
+                    fill = 0
+        else:
+            arr = data
+            pos = 0
+            n = int(arr.shape[0])
+            while pos < n:
+                take = min(n - pos, frame_bytes - fill)
+                buf[fill : fill + take] = arr[pos : pos + take]
+                fill += take
+                pos += take
+                if fill == frame_bytes:
+                    frames.append(encode_frame(f, block_start, buf))
+                    fill = 0
+
+    if fill > 0:
+        frames.append(encode_frame(f, block_start, buf[:fill]))
+    return frames
+
+
+def _write_fpz_pack_streaming(
+    state_dict: dict[str, torch.Tensor],
+    macroblocks: list[MacroblockPlan],
+    index: list[TensorIndexRecord],
+    align_bytes: int,
+    compress_flags: list[bool],
+    destination_path: str,
+    dest_dir: str,
+    silent: bool,
+    hi_chunk_bytes: int,
+) -> None:
+    """Write a compressed (fpz) pack to ``destination_path`` atomically in a
+    single pass -- no uncompressed scratch file.
+
+    Each macroblock's payload is produced on the fly from ``state_dict`` (same
+    dtype conversion and inter-tensor alignment as the uncompressed planner)
+    and either streamed through split-plane zstd frames (bf16 blocks, per
+    ``compress_flags``) or written verbatim. The footer/frame format is
+    byte-compatible with the read path. ``hi_chunk_bytes`` is the v2 high-plane
+    chunk size, recorded per fpz block so the reader reproduces the chunking.
+    """
+    zstandard = require_zstandard()
+    version = _DEFAULT_FPZ_VERSION
+    if version == 2:
+        # v2 compresses each high-plane chunk (hi_chunk_bytes uncompressed) as
+        # its own zstd frame. threads=-1 (one worker per core) does nothing for
+        # a small input and only adds per-call overhead, so use a single-threaded
+        # compressor; parallelism at repack time now comes from the many chunks,
+        # not from one big multithreaded compress. (Chunks are compressed
+        # serially here; a chunk-level thread pool is a repack-speed follow-up.)
+        chunk_compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL)
+
+        def encode_frame(f_, block_start_, frame_u8_):
+            return _fpz_encode_frame_v2(
+                f_, block_start_, frame_u8_, chunk_compressor, hi_chunk_bytes
+            )
+
+        codec_name = FPZ_CODEC_SPLITPLANE_V2
+    else:
+        # threads=-1 = one worker per core: a ~19GB high plane at single-threaded
+        # zstd-3 (~0.4 GB/s) would take ~45 min per repack; multithreaded frames
+        # keep converter jobs in minutes. Frame outputs are byte-compatible.
+        compressor = zstandard.ZstdCompressor(level=DEFAULT_ZSTD_LEVEL, threads=-1)
+
+        def encode_frame(f_, block_start_, frame_u8_):
+            return _fpz_encode_frame(f_, block_start_, frame_u8_, compressor)
+
+        codec_name = FPZ_CODEC_SPLITPLANE_V1
+
+    fd_tmp, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=".packtmp_")
+    os.close(fd_tmp)
+    progress = None
+    if not silent:
+        progress = tqdm.tqdm(desc="Packing (fpz)", total=len(index))
+    try:
+        macroblock_records: list[dict] = []
+        with open(tmp_path, "wb") as f:
+            for block_id, block in enumerate(macroblocks):
+                elem_size = torch.tensor([], dtype=block.dtype).element_size()
+                block_alignment = (
+                    math.lcm(align_bytes, elem_size) if align_bytes else elem_size
+                )
+                if block_alignment:
+                    pad = (-f.tell()) % block_alignment
+                    if pad:
+                        f.write(b"\x00" * pad)
+                block_offset = f.tell()
+
+                record = {
+                    "dtype": dtype_to_string(block.dtype),
+                    "offset_bytes": int(block_offset),
+                    "length_elems": int(block.total_elems),
+                }
+                if compress_flags[block_id]:
+                    frames = _fpz_stream_compress_block(
+                        f, block_offset, block, state_dict, encode_frame, progress
+                    )
+                    record["length_bytes"] = int(f.tell() - block_offset)
+                    fpz_record: dict = {"codec": codec_name, "frames": frames}
+                    if version == 2:
+                        # Record the chunk size so the reader reproduces the
+                        # chunking regardless of the current default, and the
+                        # chunk-start alignment so it can recompute the padded
+                        # offsets (absent = 1: pre-alignment packed layout).
+                        fpz_record["hi_chunk_usize"] = int(hi_chunk_bytes)
+                        fpz_record["hi_align"] = FPZ_HI_CHUNK_ALIGN_BYTES
+                    record["fpz"] = fpz_record
+                else:
+                    for kind, data in _iter_block_uncompressed_chunks(
+                        block, state_dict, progress
+                    ):
+                        if kind == "zeros":
+                            _write_zeros(f, data)
+                        else:
+                            f.write(data)
+                    record["length_bytes"] = int(block.length_bytes)
+                macroblock_records.append(record)
+
+            total_payload_bytes = f.tell()
+            meta_payload = {
+                "format": FILE_FORMAT_V4,
+                "align_bytes": int(align_bytes),
+                "total_payload_bytes": int(total_payload_bytes),
+                "total_elems": sum(block.total_elems for block in macroblocks),
+                "macroblocks": macroblock_records,
+                "index": [
+                    {
+                        "name": r.name,
+                        "shape": r.shape,
+                        "offset": int(r.offset),
+                        "length": int(r.length),
+                        "macroblock": int(r.macroblock),
+                    }
+                    for r in index
+                ],
+            }
+            footer_json = json.dumps(
+                meta_payload, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            f.write(footer_json)
+            f.write(U64LE.pack(len(footer_json)))
+            f.write(MAGIC)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+
+        os.replace(tmp_path, destination_path)
+        tmp_path = None
+    finally:
+        if progress is not None:
+            progress.close()
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
