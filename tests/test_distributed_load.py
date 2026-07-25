@@ -30,6 +30,15 @@ from flashpack.deserialization import (
 )
 from flashpack.serialization import pack_to_file
 
+# The gloo file:// rendezvous with an explicit loopback interface is
+# POSIX-shaped (Windows has no "lo" device: "Unable to find address for:
+# lo"); the path is covered on Linux/macOS, same policy as the O_DIRECT
+# integrity tests.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="gloo loopback rendezvous is POSIX-only in these tests",
+)
+
 _WORLD = 2
 
 
