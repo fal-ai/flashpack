@@ -33,6 +33,14 @@ from flashpack.deserialization import (
 from flashpack.serialization import pack_to_file
 from flashpack.utils import require_zstandard
 
+# The fpz read paths pull bytes with os.preadv (POSIX-only), matching the
+# repo's O_DIRECT reader; the format targets Linux GPU fleets. Encoder and
+# reader are exercised on Linux/macOS.
+pytestmark = pytest.mark.skipif(
+    not hasattr(os, "preadv"),
+    reason="fpz read paths require os.preadv (POSIX-only)",
+)
+
 
 def _bf16_state_dict() -> dict[str, torch.Tensor]:
     generator = torch.Generator().manual_seed(0)

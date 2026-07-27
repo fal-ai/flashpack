@@ -7,6 +7,8 @@ gating, the CPU-fallback warnings, and a guard that turning the flag on
 never disturbs the CPU decode path.
 """
 
+import os
+
 import pytest
 import torch
 from flashpack import deserialization
@@ -19,6 +21,14 @@ from flashpack.deserialization import (
     read_flashpack_file,
 )
 from flashpack.serialization import pack_to_file
+
+# The fpz read paths pull bytes with os.preadv (POSIX-only), matching the
+# repo's O_DIRECT reader; the format targets Linux GPU fleets. Encoder and
+# reader are exercised on Linux/macOS.
+pytestmark = pytest.mark.skipif(
+    not hasattr(os, "preadv"),
+    reason="fpz read paths require os.preadv (POSIX-only)",
+)
 
 
 def _frame_task(block_idx: int, n_out: int, out_pos: int = 0) -> tuple:

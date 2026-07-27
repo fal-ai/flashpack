@@ -6,7 +6,9 @@ validation app, not CI.
 """
 
 import ctypes
+import os
 
+import pytest
 import torch
 from flashpack import _nvcomp_ll, serialization
 from flashpack.constants import FPZ_HI_CHUNK_ALIGN_BYTES
@@ -17,6 +19,14 @@ from flashpack.deserialization import (
     read_flashpack_file,
 )
 from flashpack.serialization import pack_to_file
+
+# The fpz read paths pull bytes with os.preadv (POSIX-only), matching the
+# repo's O_DIRECT reader; the format targets Linux GPU fleets. Encoder and
+# reader are exercised on Linux/macOS.
+pytestmark = pytest.mark.skipif(
+    not hasattr(os, "preadv"),
+    reason="fpz read paths require os.preadv (POSIX-only)",
+)
 
 
 def _state_with_unaligned_tail() -> dict[str, torch.Tensor]:
