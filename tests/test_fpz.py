@@ -99,7 +99,7 @@ def test_compressed_file_is_v4_with_fpz_record(tmp_path) -> None:
     assert block["length_bytes"] < block["length_elems"] * 2
 
 
-def test_low_entropy_tensor_shrinks_file(tmp_path, capsys) -> None:
+def test_low_entropy_tensor_shrinks_file(tmp_path) -> None:
     ramp = (torch.arange(2048 * 1024, dtype=torch.float32) * 0.01).reshape(2048, 1024)
     source = {"w": ramp.to(torch.bfloat16)}
     plain = _pack(tmp_path, source, "plain.flashpack")
@@ -107,14 +107,8 @@ def test_low_entropy_tensor_shrinks_file(tmp_path, capsys) -> None:
 
     plain_size = os.path.getsize(plain)
     comp_size = os.path.getsize(comp)
-    ratio = plain_size / comp_size
-    with capsys.disabled():
-        print(
-            f"\n[fpz] low-entropy ramp: plain={plain_size} comp={comp_size} "
-            f"ratio={ratio:.3f}x"
-        )
     assert comp_size < plain_size
-    assert ratio > 1.5
+    assert plain_size / comp_size > 1.5
 
 
 def test_mixed_dtype_only_bf16_compressed(tmp_path) -> None:
@@ -462,7 +456,7 @@ def test_v1_pack_still_reads(tmp_path, monkeypatch) -> None:
         assert torch.equal(_uint16_view(tensors[name]), _uint16_view(original))
 
 
-def test_v2_ratio_close_to_v1(tmp_path, monkeypatch, capsys) -> None:
+def test_v2_ratio_close_to_v1(tmp_path, monkeypatch) -> None:
     # v2 compresses each 64 KiB chunk independently, so it shrinks slightly less
     # than v1's single-frame high plane. Measure both on a realistic low-entropy
     # tensor; v2 must still compress and stay within a modest margin of v1.
@@ -478,12 +472,6 @@ def test_v2_ratio_close_to_v1(tmp_path, monkeypatch, capsys) -> None:
     plain_sz = os.path.getsize(plain)
     v1_sz = os.path.getsize(v1)
     v2_sz = os.path.getsize(v2)
-    with capsys.disabled():
-        print(
-            f"\n[fpz] ratio plain={plain_sz} "
-            f"v1={v1_sz} ({plain_sz / v1_sz:.3f}x) "
-            f"v2={v2_sz} ({plain_sz / v2_sz:.3f}x) v2/v1={v2_sz / v1_sz:.3f}"
-        )
     assert v2_sz < plain_sz  # v2 still compresses
     assert v2_sz <= v1_sz * 1.25  # within a modest margin of v1
 
