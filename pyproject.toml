@@ -43,6 +43,8 @@ dev = [
     "pytest>=8.4.1",
     "pre-commit>=3.0.0",
     "setuptools-scm>=9.2.0",
+    # fpz tests exercise the compressed format end to end
+    "zstandard>=0.22",
 ]
 fpz = [
     "zstandard>=0.22",
