@@ -28,8 +28,7 @@ ABI notes (verified against the headers shipped in nvidia-libnvcomp-cu12
   must be real device buffers (unlike LZ4, where NULL is tolerated).
 
 Load failures (missing wheel, missing symbol, non-Linux) degrade to
-``load()`` returning ``None``; callers keep the pybind wrapper path as the
-fallback.
+``load()`` returning ``None``; callers fall back to the CPU decode path.
 """
 
 from __future__ import annotations
@@ -208,7 +207,7 @@ _loaded: tuple[NvcompLL | None] | None = None
 
 def load() -> NvcompLL | None:
     """Load and bind libnvcomp once; ``None`` (with a single warning) on any
-    failure so callers can fall back to the pybind wrapper path."""
+    failure so callers can fall back to the CPU decode path."""
     global _loaded
     with _load_lock:
         if _loaded is not None:
@@ -219,7 +218,7 @@ def load() -> NvcompLL | None:
             logger.warning(
                 "flashpack: libnvcomp not found (pip install "
                 "nvidia-libnvcomp-cu12); batched GPU decode unavailable, "
-                "falling back to the nvcomp wrapper path."
+                "falling back to the CPU decode path."
             )
         else:
             try:
@@ -227,7 +226,7 @@ def load() -> NvcompLL | None:
             except (OSError, AttributeError) as e:
                 logger.warning(
                     "flashpack: could not bind batched nvcomp API from %s "
-                    "(%s); falling back to the nvcomp wrapper path.",
+                    "(%s); falling back to the CPU decode path.",
                     path,
                     e,
                 )

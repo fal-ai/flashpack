@@ -1,24 +1,19 @@
-"""CPU-testable surface of the nvcomp GPU Zstd decode path for fpz.
+"""CPU-testable surface of the fpz GPU decode path.
 
-The GPU decode itself needs a CUDA device and nvcomp, so it is exercised on the
-H200, not in CI. What IS testable without a device -- and what these cover -- is
-everything around it: the pure frame-batch planner, the env gating, and the
-guarded-import fallback (including warn-once), plus a guard that turning the
-flag on never disturbs the CPU decode path.
+The GPU decode itself needs a CUDA device and libnvcomp, so it is exercised
+on GPU hosts, not in CI. What IS testable without a device -- and what these
+cover -- is everything around it: the pure frame-batch planner, the env
+gating, the CPU-fallback warnings, and a guard that turning the flag on
+never disturbs the CPU decode path.
 """
-
-import sys
 
 import pytest
 import torch
 from flashpack import deserialization
 from flashpack.deserialization import (
     _env_flag,
-    _env_flag_default,
-    _fpz_batch_signature,
     _fpz_gpu_decode_enabled,
     _fpz_hi_chunk_usizes,
-    _load_nvcomp,
     iterate_from_flash_tensor,
     plan_fpz_gpu_batches,
     read_flashpack_file,
@@ -95,30 +90,6 @@ def test_plan_rejects_nonpositive_byte_budget(bad: int) -> None:
 
 
 # --------------------------------------------------------------------------
-# _fpz_batch_signature -- pure config-cache key
-# --------------------------------------------------------------------------
-
-
-def test_signature_is_per_frame_half_sizes() -> None:
-    batch = [_frame_task(0, 100), _frame_task(0, 40)]
-    assert _fpz_batch_signature(batch) == (50, 20)
-
-
-def test_signature_matches_for_same_shape_batches() -> None:
-    # Two batches of identical full-frame shapes hash to the same key -> they
-    # share one cached DecompressConfig (the whole point of the cache).
-    a = [_frame_task(0, 128), _frame_task(0, 128)]
-    b = [_frame_task(1, 128), _frame_task(2, 128)]
-    assert _fpz_batch_signature(a) == _fpz_batch_signature(b) == (64, 64)
-
-
-def test_signature_differs_when_a_tail_frame_changes_shape() -> None:
-    full = [_frame_task(0, 128), _frame_task(0, 128)]
-    with_tail = [_frame_task(0, 128), _frame_task(0, 40)]
-    assert _fpz_batch_signature(full) != _fpz_batch_signature(with_tail)
-
-
-# --------------------------------------------------------------------------
 # _fpz_hi_chunk_usizes -- pure v2 chunk sizing (matches the encoder)
 # --------------------------------------------------------------------------
 
@@ -175,97 +146,27 @@ def test_env_flag_unset_is_false(monkeypatch) -> None:
     assert _fpz_gpu_decode_enabled() is False
 
 
-def test_env_flag_default_respects_default_when_unset(monkeypatch) -> None:
-    monkeypatch.delenv("FLASHPACK_FPZ_GPU_TORCH_ALLOC", raising=False)
-    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", True) is True
-    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", False) is False
-
-
-@pytest.mark.parametrize(
-    "value,expected", [("0", False), ("false", False), ("1", True), ("on", True)]
-)
-def test_env_flag_default_env_overrides(monkeypatch, value, expected) -> None:
-    monkeypatch.setenv("FLASHPACK_FPZ_GPU_TORCH_ALLOC", value)
-    # Env always wins over the default, in both directions.
-    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", True) is expected
-    assert _env_flag_default("FLASHPACK_FPZ_GPU_TORCH_ALLOC", False) is expected
-
-
 # --------------------------------------------------------------------------
-# torch caching allocator wiring into nvcomp (guarded, idempotent)
+# CPU-fallback warning (warn once)
 # --------------------------------------------------------------------------
 
 
-class _FakeNvcompAllocOK:
-    def __init__(self) -> None:
-        self.installed = None
+def test_gpu_decoder_missing_libnvcomp_warns_once_and_falls_back(
+    monkeypatch,
+) -> None:
+    from flashpack import _nvcomp_ll
 
-    def set_device_allocator(self, allocator) -> None:
-        self.installed = allocator
-
-
-class _FakeNvcompAllocRaises:
-    def set_device_allocator(self, allocator) -> None:
-        raise RuntimeError("no allocator hook here")
-
-
-def _reset_alloc_latches(monkeypatch) -> None:
-    monkeypatch.setattr(deserialization, "_FPZ_NVCOMP_ALLOC_INSTALLED", False)
-    monkeypatch.setattr(deserialization, "_FPZ_NVCOMP_ALLOC_WARNED", False)
-
-
-def test_install_allocator_success_registers_a_callable(monkeypatch) -> None:
-    _reset_alloc_latches(monkeypatch)
-    fake = _FakeNvcompAllocOK()
-    ok = deserialization._install_torch_nvcomp_allocator(fake, torch.device("cuda:0"))
-    assert ok is True
-    assert callable(fake.installed)
-
-
-def test_install_allocator_is_idempotent(monkeypatch) -> None:
-    _reset_alloc_latches(monkeypatch)
-    first = _FakeNvcompAllocOK()
-    assert deserialization._install_torch_nvcomp_allocator(
-        first, torch.device("cuda:0")
-    )
-    # Already installed globally: a second call is a no-op and does not
-    # re-register on another (fake) module.
-    second = _FakeNvcompAllocOK()
-    assert deserialization._install_torch_nvcomp_allocator(
-        second, torch.device("cuda:0")
-    )
-    assert second.installed is None
-
-
-def test_install_allocator_failure_is_guarded_and_warns(monkeypatch) -> None:
-    _reset_alloc_latches(monkeypatch)
-    with pytest.warns(RuntimeWarning, match="set_device_allocator"):
-        ok = deserialization._install_torch_nvcomp_allocator(
-            _FakeNvcompAllocRaises(), torch.device("cuda:0")
-        )
-    assert ok is False
-
-
-# --------------------------------------------------------------------------
-# guarded import + warn-once fallback
-# --------------------------------------------------------------------------
-
-
-def test_load_nvcomp_missing_returns_none_and_warns_once(monkeypatch) -> None:
-    # Force the import to fail regardless of what's installed, and reset the
-    # process-level warn-once latch so the assertion is deterministic.
-    monkeypatch.setitem(sys.modules, "nvidia", None)
+    monkeypatch.setattr(_nvcomp_ll, "_loaded", (None,))
     monkeypatch.setattr(deserialization, "_FPZ_GPU_DECODE_WARNED", False)
 
-    with pytest.warns(RuntimeWarning, match="nvcomp"):
-        assert _load_nvcomp() is None
+    with pytest.warns(RuntimeWarning, match="libnvcomp"):
+        assert deserialization._fpz_gpu_decoder([]) is None
 
-    # Second call: still None, but no second warning (warn-once).
     import warnings as _warnings
 
     with _warnings.catch_warnings():
         _warnings.simplefilter("error")  # any warning would raise
-        assert _load_nvcomp() is None
+        assert deserialization._fpz_gpu_decoder([]) is None
 
 
 # --------------------------------------------------------------------------
