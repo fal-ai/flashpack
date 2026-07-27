@@ -13,6 +13,11 @@ class TestSampleProbe:
         p.write_bytes(b"x" * 1024)
         assert _sample_read_gbps(str(p), 1024) == float("inf")
 
+    @pytest.mark.skipif(
+        not hasattr(os, "preadv"),
+        reason="the sample probe reads with preadv (POSIX-only); on platforms "
+        "without it the probe reports cold and the reader keeps O_DIRECT off",
+    )
     def test_probe_returns_rate_on_real_file(self, tmp_path) -> None:
         from flashpack.parallel_read import (
             _SAMPLE_PROBE_BYTES,
