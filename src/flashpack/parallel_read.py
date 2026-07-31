@@ -66,6 +66,7 @@ __all__ = [
 
 _ALIGN = 4096
 _BUFFERS_PER_THREAD = 2
+_DEFAULT_READ_THREADS = 16
 
 _POSIX_FADV_DONTNEED = 4
 
@@ -328,7 +329,12 @@ def parallel_read_into_storage(
         _parallel_read_into_cpu_storage(path, specs, blocks)
         return
 
-    n_threads = effective_read_threads(_env_int("FLASHPACK_READ_THREADS", 16))
+    # IO-bound path: threads are the IO queue depth, so the affinity clamp
+    # floors at the default -- only oversubscribed requests get capped.
+    n_threads = effective_read_threads(
+        _env_int("FLASHPACK_READ_THREADS", _DEFAULT_READ_THREADS),
+        floor=_DEFAULT_READ_THREADS,
+    )
     chunk_bytes = max(_ALIGN, _env_int("FLASHPACK_READ_CHUNK_BYTES", 64 * 1024 * 1024))
 
     byte_views = [b.view(torch.uint8) for b in blocks]

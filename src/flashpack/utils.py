@@ -59,15 +59,26 @@ def maybe_init_distributed(
         torch.cuda.set_device(torch.device(f"cuda:{local_rank}"))
 
 
-def effective_read_threads(requested: int) -> int:
-    """Clamp a reader-thread request to the CPUs this process may run on.
+def effective_read_threads(requested: int, *, floor: int = 1) -> int:
+    """Cap a reader-thread request at ``max(cpu affinity, floor)``.
 
-    Reader threads do GIL-releasing pread/decode/memcpy work; running more of
-    them than the process's CPU affinity allows never helps and measurably
-    hurts (oversubscription, and on the GPU paths each thread owns a CUDA
-    stream -- co-located stream counts in the dozens are stream-collapse
-    territory). Prod runners execute in dedicated cpusets, so the affinity
-    mask -- not ``os.cpu_count()`` -- is the real budget. Escape hatch:
+    Two regimes, measured separately:
+
+    - CPU-bound reader work (eager CPU-destination reads, compressed-plane
+      decode) is budgeted by the CPUs the process may actually run on;
+      oversubscribing the affinity mask never helps there. Those call sites
+      use the default ``floor=1`` (a pure affinity clamp).
+    - The raw file->GPU path is IO-bound: reader threads spend most of their
+      time blocked in ``pread``, so they are the IO queue depth, not CPU
+      consumers. Clamping below the default thread count starves the device
+      (same-node interleaved A/B on a 12-CPU H200, 38 GB pack: 12 threads
+      11.3-11.9 GB/s vs 16 threads 13.2-14.2 cold; on a 6-CPU cpuset the gap
+      is 2x). That path passes ``floor=<default>`` so the clamp only caps
+      requests above ``max(affinity, default)`` -- oversubscribed requests
+      (e.g. 64 threads on 12 CPUs, measured unstable) still get capped.
+
+    Prod runners execute in dedicated cpusets, so the affinity mask -- not
+    ``os.cpu_count()`` -- is the real budget. Escape hatch:
     ``FLASHPACK_NO_THREAD_CLAMP=1`` restores the unclamped request.
     """
     if os.environ.get("FLASHPACK_NO_THREAD_CLAMP", "").strip().lower() in (
@@ -81,7 +92,7 @@ def effective_read_threads(requested: int) -> int:
         cpus = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):  # non-Linux
         cpus = os.cpu_count() or requested
-    return max(1, min(requested, cpus))
+    return max(1, min(requested, max(cpus, floor)))
 
 
 def get_module_and_attribute(
