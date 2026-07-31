@@ -30,10 +30,13 @@ FPZ_CODEC_SPLITPLANE_V1 = "zstd-splitplane-v1"
 FPZ_CODEC_SPLITPLANE_V2 = "zstd-splitplane-v2"
 FPZ_FRAME_UNCOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
 FPZ_FRAME_ALIGN_BYTES = 4096
-# Per-chunk uncompressed size for the v2 high plane. Matches nvcomp's default
-# uncomp_chunk_size (65536) and divides the 32 MiB half-frame evenly (512
-# chunks), so full frames have no odd-sized tail chunk.
-FPZ_HI_CHUNK_UNCOMPRESSED_BYTES = 64 * 1024
+# Per-chunk uncompressed size for the v2 high plane. Divides the 32 MiB
+# half-frame evenly (32 chunks), so full frames have no odd-sized tail chunk.
+# Measured on a 38 GB pack (same-boot interleaved A/B): 64 KiB chunks -- the
+# nvcomp default this constant originally matched -- decode 2.6x slower than
+# 1 MiB on the threaded CPU path (per-chunk overhead x 512 chunks per frame),
+# for a compression-ratio difference under 1% (1.412x vs 1.401x).
+FPZ_HI_CHUNK_UNCOMPRESSED_BYTES = 1024 * 1024
 # Byte alignment of each v2 compressed chunk's START within the frame payload
 # (chunks are padded to this; "hi_chunks" still records true zstd lengths and
 # the reader recomputes padded offsets from the block's "hi_align" footer

@@ -427,8 +427,8 @@ def test_cpu_decode_scales_with_threads(tmp_path, monkeypatch) -> None:
 
 
 def test_v2_frame_splits_high_plane_into_chunks(tmp_path) -> None:
-    # A 1024x512 bf16 tensor has a 512 KiB high plane -> several 64 KiB chunks.
-    source = {"w": torch.randn(1024, 512).to(torch.bfloat16)}
+    # A 4096x1024 bf16 tensor has a 4 MiB high plane -> several 1 MiB chunks.
+    source = {"w": torch.randn(4096, 1024).to(torch.bfloat16)}
     comp = _pack(tmp_path, source, "comp.flashpack", compress="fpz-bf16")
     block = get_flashpack_file_metadata(comp)["macroblocks"][0]
     assert block["fpz"]["codec"] == FPZ_CODEC_SPLITPLANE_V2
