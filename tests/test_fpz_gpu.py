@@ -7,8 +7,6 @@ gating, the CPU-fallback warnings, and a guard that turning the flag on
 never disturbs the CPU decode path.
 """
 
-import os
-
 import pytest
 import torch
 from flashpack import deserialization
@@ -21,6 +19,7 @@ from flashpack.deserialization import (
     read_flashpack_file,
 )
 from flashpack.serialization import pack_to_file
+
 
 def _frame_task(block_idx: int, n_out: int, out_pos: int = 0) -> tuple:
     # Matches _fpz_frame_tasks' ("frame", block_idx, frame, out_pos) shape.

@@ -369,9 +369,7 @@ if hasattr(os, "preadv"):
         while got < n:
             r = os.preadv(fd, [mv[got:]], offset + got)
             if r <= 0:
-                raise IOError(
-                    f"short read: wanted {n} bytes at {offset}, got {got}"
-                )
+                raise IOError(f"short read: wanted {n} bytes at {offset}, got {got}")
             got += r
 
 else:
@@ -386,9 +384,7 @@ else:
             os.lseek(fd, offset + got, os.SEEK_SET)
             b = os.read(fd, n - got)
             if not b:
-                raise IOError(
-                    f"short read: wanted {n} bytes at {offset}, got {got}"
-                )
+                raise IOError(f"short read: wanted {n} bytes at {offset}, got {got}")
             mv[got : got + len(b)] = b
             got += len(b)
 
@@ -519,7 +515,7 @@ def _fpz_read_into_cpu_storage(
 
     def _reader() -> None:
         try:
-            fd = os.open(path, os.O_RDONLY)
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             decompressor = zstandard.ZstdDecompressor()
             try:
                 while True:
@@ -615,7 +611,7 @@ def _fpz_read_into_cuda_storage(
 
     def _reader() -> None:
         try:
-            fd = os.open(path, os.O_RDONLY)
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             decompressor = zstandard.ZstdDecompressor()
             stream = torch.cuda.Stream(device=device)
             stream.wait_event(alloc_ready)
@@ -969,7 +965,7 @@ def _fpz_read_into_cuda_storage_gpu(
 
     def _reader(thread_idx: int) -> None:
         try:
-            fd = os.open(path, os.O_RDONLY)
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             stream = torch.cuda.Stream(device=device)
             stream.wait_event(alloc_ready)
             # One contiguous staging set per slot; frame k lives at

@@ -33,6 +33,7 @@ from flashpack.deserialization import (
 from flashpack.serialization import pack_to_file
 from flashpack.utils import require_zstandard
 
+
 def _bf16_state_dict() -> dict[str, torch.Tensor]:
     generator = torch.Generator().manual_seed(0)
     # A genuinely high-entropy tensor (randn) and a low-entropy one (a smooth

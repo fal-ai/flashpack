@@ -18,6 +18,7 @@ from flashpack.deserialization import (
 )
 from flashpack.serialization import pack_to_file
 
+
 def _state_with_unaligned_tail() -> dict[str, torch.Tensor]:
     # An odd bf16 element count makes the (single, partial) frame's half-plane
     # length odd -- NOT a multiple of the chunk alignment -- so the test
