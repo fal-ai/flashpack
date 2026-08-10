@@ -318,6 +318,77 @@ def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
         dist.broadcast(block.view(torch.uint8), src=src)
 
 
+def _shard_range(
+    length_bytes: int, world: int, rank: int, align: int = 4096
+) -> tuple[int, int]:
+    """Byte range ``[lo, hi)`` of rank ``rank``'s shard of a block.
+
+    Boundaries are rounded down to ``align`` so every shard start satisfies
+    the reader's O_DIRECT file-offset requirement, and (because 4096 is a
+    multiple of every element size flashpack stores) always falls on an
+    element boundary. Blocks smaller than ``world * align`` leave the high
+    ranks with empty ranges -- callers skip those consistently, so the
+    collective call order stays identical on every rank.
+    """
+    if length_bytes <= 0:
+        return (0, 0)
+    per = length_bytes / world
+    lo = int(per * rank) // align * align
+    hi = int(per * (rank + 1)) // align * align if rank + 1 < world else length_bytes
+    return (min(lo, length_bytes), min(max(hi, lo), length_bytes))
+
+
+def _read_storage_sharded(
+    path: str,
+    specs: list[MacroblockSpec],
+    storage: FlashTensorStorage,
+    device: torch.device,
+) -> None:
+    """Every rank reads its 1/N byte shard of each block, then each shard is
+    broadcast from its owner: total disk bytes moved stay one pack-read, but
+    the read wall drops toward ``read_time / world`` because ranks read in
+    parallel, and the interleaved broadcasts run at NVLink rates.
+    """
+    from .parallel_read import parallel_read_into_storage
+
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+
+    sub_specs: list[MacroblockSpec] = []
+    sub_blocks: list[torch.Tensor] = []
+    for spec, block in zip(specs, storage.blocks):
+        lo, hi = _shard_range(spec.length_bytes, world, rank)
+        if hi <= lo:
+            continue
+        elem = block.element_size()
+        sub_specs.append(
+            MacroblockSpec(
+                dtype=spec.dtype,
+                offset_bytes=spec.offset_bytes + lo,
+                length_bytes=hi - lo,
+                length_elems=(hi - lo) // elem,
+            )
+        )
+        sub_blocks.append(block.narrow(0, lo // elem, (hi - lo) // elem))
+    if sub_specs:
+        parallel_read_into_storage(path, sub_specs, sub_blocks, device)
+
+    # Interleaved owner broadcasts, identical op order on every rank. Each
+    # broadcast is issued async so rank i's send of shard i overlaps the
+    # remaining collectives on the backend stream.
+    works = []
+    for src_rank in range(world):
+        for spec, block in zip(specs, storage.blocks):
+            lo, hi = _shard_range(spec.length_bytes, world, src_rank)
+            if hi <= lo:
+                continue
+            elem = block.element_size()
+            view = block.narrow(0, lo // elem, (hi - lo) // elem).view(torch.uint8)
+            works.append(dist.broadcast(view, src=src_rank, async_op=True))
+    for w in works:
+        w.wait()
+
+
 def read_flashpack_file(
     path: str,
     device: str | torch.device = "cpu",
@@ -387,9 +458,18 @@ def read_flashpack_file_distributed(
     num_streams: int = DEFAULT_NUM_STREAMS,
     silent: bool = True,
     metadata: dict[str, Any] | None = None,
+    sharded: bool = False,
 ) -> tuple[FlashTensorStorage, dict[str, Any]]:
     """Rank-``src`` reads the pack from disk; every rank returns the full
     storage, received via broadcast.
+
+    With ``sharded=True`` every rank instead reads a contiguous 1/N byte
+    shard of each block and each shard is broadcast from its owner: the same
+    one-pack-read total, but the disk wall drops toward ``read / world``
+    because ranks read in parallel. Requires every rank to be able to read
+    the pack payload from ``path`` (rank-``src`` mode only needs the footer
+    on non-src ranks). Falls back to rank-``src`` mode for packs with
+    compressed (fpz) blocks, whose on-disk bytes are not shard-addressable.
 
     This removes the N-times read amplification of world-size-N loads: the
     reader deliberately bypasses the page cache (O_DIRECT), so without this
@@ -414,6 +494,15 @@ def read_flashpack_file_distributed(
             f"a cuda device, got {device}."
         )
     meta = metadata or get_flashpack_file_metadata(path)
+    if sharded and any(
+        "fpz" in block for block in meta.get("macroblocks", []) or []
+    ):
+        sharded = False  # compressed payload bytes are not shard-addressable
+    if sharded and dist.get_world_size() > 1:
+        specs = _build_macroblock_specs(meta)
+        storage = _allocate_empty_storage(specs, device)
+        _read_storage_sharded(path, specs, storage, device)
+        return storage, meta
     if dist.get_rank() == src:
         storage, meta = read_flashpack_file(
             path=path,

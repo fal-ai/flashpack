@@ -24,6 +24,7 @@ import torch.multiprocessing as mp
 from flashpack.deserialization import (
     FlashTensorStorage,
     _broadcast_storage,
+    _shard_range,
     assign_from_file,
     iterate_from_flash_tensor,
     read_flashpack_file_distributed,
@@ -161,3 +162,61 @@ def test_read_distributed_requires_process_group(tmp_path) -> None:
     assert not dist.is_initialized()
     with pytest.raises(RuntimeError, match="process group"):
         read_flashpack_file_distributed(pack, device="cpu")
+
+
+def test_shard_range_covers_disjoint_aligned() -> None:
+    for length in (0, 1, 4095, 4096, 8192, 67_584, 1_000_000, 40 * 1024 * 1024):
+        for world in (1, 2, 4, 8):
+            ranges = [_shard_range(length, world, r) for r in range(world)]
+            # disjoint, ordered, and covering exactly [0, length)
+            pos = 0
+            for lo, hi in ranges:
+                assert lo == pos or lo == hi  # empty shards collapse in place
+                assert lo % 4096 == 0
+                pos = max(pos, hi)
+            assert pos == length
+            # non-final boundaries land on element boundaries for all dtypes
+            for _, hi in ranges[:-1]:
+                assert hi % 4096 == 0 or hi == length
+
+
+def _sharded_source() -> dict[str, torch.Tensor]:
+    g = torch.Generator().manual_seed(11)
+    state = {
+        # big enough that both ranks get a real shard (>= 2 x 4096 bytes)
+        "big.bf16": torch.randn(1024, 512, generator=g).to(torch.bfloat16),
+        "big.fp32": torch.randn(600, 512, generator=g),
+        # small enough that only rank 0 gets bytes (empty-shard path)
+        "tiny.fp32": torch.randn(63, generator=g),
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        state["q.fp8"] = torch.randn(4096, 64, generator=g).to(torch.float8_e4m3fn)
+    return state
+
+
+def _read_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
+    _init(rank, init_file)
+    try:
+        storage, meta = read_flashpack_file_distributed(
+            pack_path, device="cpu", sharded=True
+        )
+        got = dict(iterate_from_flash_tensor(storage, meta))
+        state = _sharded_source()
+        assert set(got) == set(state)
+        for name, tensor in state.items():
+            assert torch.equal(
+                got[name].view(torch.uint8), tensor.contiguous().view(torch.uint8)
+            ), f"rank {rank} {name} mismatch"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_read_flashpack_file_distributed_sharded(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_sharded_source(), pack, None)
+    mp.spawn(
+        _read_sharded_worker,
+        args=(str(tmp_path / "rdv4"), pack),
+        nprocs=_WORLD,
+        join=True,
+    )
