@@ -220,3 +220,32 @@ def test_read_flashpack_file_distributed_sharded(tmp_path) -> None:
         nprocs=_WORLD,
         join=True,
     )
+
+
+def _assign_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
+    _init(rank, init_file)
+    try:
+        model = _TwoParam()
+        assign_from_file(
+            model,
+            pack_path,
+            device="cpu",
+            use_distributed_loading=True,
+            distributed_sharded=True,
+        )
+        state = _source_state()
+        assert torch.equal(model.a.data, state["a"]), f"rank {rank} a mismatch"
+        assert torch.equal(model.b.data, state["b"]), f"rank {rank} b mismatch"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_assign_from_file_distributed_sharded(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_source_state(), pack, None)
+    mp.spawn(
+        _assign_sharded_worker,
+        args=(str(tmp_path / "rdv5"), pack),
+        nprocs=_WORLD,
+        join=True,
+    )

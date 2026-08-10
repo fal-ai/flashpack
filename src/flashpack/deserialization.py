@@ -622,6 +622,7 @@ def assign_from_file(
     ignore_prefixes: list[str] | None = None,
     ignore_suffixes: list[str] | None = None,
     use_distributed_loading: bool = False,
+    distributed_sharded: bool = False,
     rank: int | None = None,
     local_rank: int | None = None,
     world_size: int | None = None,
@@ -629,6 +630,10 @@ def assign_from_file(
 ) -> None:
     """
     Assign the weights from a flashpack file to a model.
+
+    ``distributed_sharded=True`` (with ``use_distributed_loading=True``) makes
+    every rank read a 1/N shard instead of rank 0 reading the whole pack; see
+    ``read_flashpack_file_distributed``.
     """
     if device is None:
         try:
@@ -653,6 +658,7 @@ def assign_from_file(
             silent=silent,
             num_streams=num_streams,
             chunk_bytes=chunk_bytes,
+            sharded=distributed_sharded,
         )
     else:
         flash_storage, meta = read_flashpack_file(
