@@ -494,9 +494,7 @@ def read_flashpack_file_distributed(
             f"a cuda device, got {device}."
         )
     meta = metadata or get_flashpack_file_metadata(path)
-    if sharded and any(
-        "fpz" in block for block in meta.get("macroblocks", []) or []
-    ):
+    if sharded and any("fpz" in block for block in meta.get("macroblocks", []) or []):
         sharded = False  # compressed payload bytes are not shard-addressable
     if sharded and dist.get_world_size() > 1:
         specs = _build_macroblock_specs(meta)
