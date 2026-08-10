@@ -43,6 +43,19 @@ dev = [
     "pytest>=8.4.1",
     "pre-commit>=3.0.0",
     "setuptools-scm>=9.2.0",
+    # fpz tests exercise the compressed format end to end
+    "zstandard>=0.22",
+]
+fpz = [
+    "zstandard>=0.22",
+]
+# GPU Zstd decode for the fpz read path (opt-in via FLASHPACK_FPZ_GPU_DECODE=1).
+# NOTE: nvidia-libnvcomp-cu12 is NVIDIA-proprietary redistributable software,
+# not OSI-licensed -- a license review is required before this extra ships.
+# Kept out of the default and `fpz` deps so a plain install stays MIT-only.
+fpz-gpu = [
+    "zstandard>=0.22",
+    "nvidia-libnvcomp-cu12",
 ]
 
 [tool.setuptools_scm]
