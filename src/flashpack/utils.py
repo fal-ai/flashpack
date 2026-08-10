@@ -59,6 +59,42 @@ def maybe_init_distributed(
         torch.cuda.set_device(torch.device(f"cuda:{local_rank}"))
 
 
+def effective_read_threads(requested: int, *, floor: int = 1) -> int:
+    """Cap a reader-thread request at ``max(cpu affinity, floor)``.
+
+    Two regimes, measured separately:
+
+    - CPU-bound reader work (eager CPU-destination reads, compressed-plane
+      decode) is budgeted by the CPUs the process may actually run on;
+      oversubscribing the affinity mask never helps there. Those call sites
+      use the default ``floor=1`` (a pure affinity clamp).
+    - The raw file->GPU path is IO-bound: reader threads spend most of their
+      time blocked in ``pread``, so they are the IO queue depth, not CPU
+      consumers. Clamping below the default thread count starves the device
+      (same-node interleaved A/B on a 12-CPU H200, 38 GB pack: 12 threads
+      11.3-11.9 GB/s vs 16 threads 13.2-14.2 cold; on a 6-CPU cpuset the gap
+      is 2x). That path passes ``floor=<default>`` so the clamp only caps
+      requests above ``max(affinity, default)`` -- oversubscribed requests
+      (e.g. 64 threads on 12 CPUs, measured unstable) still get capped.
+
+    Prod runners execute in dedicated cpusets, so the affinity mask -- not
+    ``os.cpu_count()`` -- is the real budget. Escape hatch:
+    ``FLASHPACK_NO_THREAD_CLAMP=1`` restores the unclamped request.
+    """
+    if os.environ.get("FLASHPACK_NO_THREAD_CLAMP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return max(1, requested)
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # non-Linux
+        cpus = os.cpu_count() or requested
+    return max(1, min(requested, max(cpus, floor)))
+
+
 def get_module_and_attribute(
     model: torch.nn.Module,
     name: str,
@@ -73,6 +109,23 @@ def get_module_and_attribute(
         raise ValueError(f"Module not found: {module_path}")
 
     return module, name
+
+
+def require_zstandard():
+    """Import the optional ``zstandard`` dependency for fpz compression.
+
+    zstandard is not a hard dependency of flashpack; it is only needed to
+    write or read fpz-compressed packs. Install it with ``pip install
+    'flashpack[fpz]'`` (see the ``fpz`` extra in ``pyproject.toml``).
+    """
+    try:
+        import zstandard
+    except ImportError as e:  # pragma: no cover - exercised via message only
+        raise ImportError(
+            "fpz compression requires the optional 'zstandard' package. "
+            "Install it with: pip install 'flashpack[fpz]'"
+        ) from e
+    return zstandard
 
 
 def string_to_dtype(string: str) -> torch.dtype:

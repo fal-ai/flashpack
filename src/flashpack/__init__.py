@@ -2,6 +2,7 @@ from .deserialization import (
     assign_from_file,
     get_flashpack_file_metadata,
     is_flashpack_file,
+    read_flashpack_file_distributed,
 )
 from .integrations import patch_integrations
 from .mixin import FlashPackMixin
@@ -21,6 +22,7 @@ __all__ = [
     "assign_from_file",
     "is_flashpack_file",
     "get_flashpack_file_metadata",
+    "read_flashpack_file_distributed",
     "pack_to_file",
     "__version__",
     "__version_tuple__",

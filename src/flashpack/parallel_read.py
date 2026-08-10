@@ -53,6 +53,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from .utils import effective_read_threads
+
 if TYPE_CHECKING:
     from .deserialization import MacroblockSpec
 
@@ -64,6 +66,7 @@ __all__ = [
 
 _ALIGN = 4096
 _BUFFERS_PER_THREAD = 2
+_DEFAULT_READ_THREADS = 16
 
 _POSIX_FADV_DONTNEED = 4
 
@@ -251,7 +254,7 @@ def _parallel_read_into_cpu_storage(
     destination address; every misaligned or failing chunk degrades to a
     buffered read of identical bytes.
     """
-    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+    n_threads = effective_read_threads(_env_int("FLASHPACK_READ_THREADS", 16))
     chunk_bytes = max(_ALIGN, _env_int("FLASHPACK_READ_CHUNK_BYTES", 64 * 1024 * 1024))
 
     byte_views = [b.view(torch.uint8) for b in blocks]
@@ -326,7 +329,12 @@ def parallel_read_into_storage(
         _parallel_read_into_cpu_storage(path, specs, blocks)
         return
 
-    n_threads = max(1, _env_int("FLASHPACK_READ_THREADS", 16))
+    # IO-bound path: threads are the IO queue depth, so the affinity clamp
+    # floors at the default -- only oversubscribed requests get capped.
+    n_threads = effective_read_threads(
+        _env_int("FLASHPACK_READ_THREADS", _DEFAULT_READ_THREADS),
+        floor=_DEFAULT_READ_THREADS,
+    )
     chunk_bytes = max(_ALIGN, _env_int("FLASHPACK_READ_CHUNK_BYTES", 64 * 1024 * 1024))
 
     byte_views = [b.view(torch.uint8) for b in blocks]
