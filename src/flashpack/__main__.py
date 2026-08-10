@@ -6,7 +6,7 @@ import click
 
 from . import __version__
 from .commands import convert_to_flashpack, revert_from_flashpack
-from .constants import FILE_FORMAT_V3, FILE_FORMAT_V4
+from .constants import FILE_FORMAT_V3, FILE_FORMAT_V4, FILE_FORMAT_V5
 from .deserialization import get_flashpack_file_metadata
 from .integrations import patch_integrations
 
@@ -63,7 +63,7 @@ def metadata(path: str, show_index: bool, json: bool) -> None:
         macroblocks = None
         format = metadata.get("format")
 
-        if format == FILE_FORMAT_V4:
+        if format in (FILE_FORMAT_V4, FILE_FORMAT_V5):
             num_digits = len(str(metadata.get("total_payload_bytes", 0)))
         elif format == FILE_FORMAT_V3:
             num_digits = len(str(metadata.get("total_elems", 0)))
@@ -100,7 +100,7 @@ def metadata(path: str, show_index: bool, json: bool) -> None:
                         macroblock_dtype = macroblocks[macroblock]["dtype"]
                     else:
                         macroblock_dtype = metadata["target_dtype"]
-                    if format == FILE_FORMAT_V4:
+                    if format in (FILE_FORMAT_V4, FILE_FORMAT_V5):
                         print(
                             f"  {cyan('macroblock' + str(macroblock))}: {macroblock_dtype.ljust(10)} {r['offset']:0{num_digits}d}:{r['offset'] + r['length']:0{num_digits}d}"
                         )

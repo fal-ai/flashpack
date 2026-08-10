@@ -20,6 +20,7 @@ from .constants import (
     DEFAULT_NUM_STREAMS,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
+    FILE_FORMAT_V5,
     FPZ_CODEC_SPLITPLANE_V1,
     FPZ_CODEC_SPLITPLANE_V2,
     FPZ_FRAME_UNCOMPRESSED_BYTES,
@@ -105,7 +106,7 @@ def get_flashpack_file_metadata(path: str) -> dict[str, Any]:
         f.seek(start)
         meta = json.loads(f.read(json_len).decode("utf-8"))
         fmt = meta.get("format")
-        if fmt not in (FILE_FORMAT_V3, FILE_FORMAT_V4):
+        if fmt not in (FILE_FORMAT_V3, FILE_FORMAT_V4, FILE_FORMAT_V5):
             raise ValueError(f"Unexpected format: {fmt}")
 
         return meta
@@ -151,7 +152,7 @@ def _build_macroblock_specs(meta: dict[str, Any]) -> list[MacroblockSpec]:
                 length_elems=total_elems,
             )
         )
-    elif fmt == FILE_FORMAT_V4:
+    elif fmt in (FILE_FORMAT_V4, FILE_FORMAT_V5):
         macroblocks = meta.get("macroblocks")
         if not macroblocks:
             raise ValueError("Missing macroblock metadata for flashpack v4 file.")
@@ -357,16 +358,39 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _pread_into(fd: int, offset: int, mv: memoryview) -> None:
-    """Fill ``mv`` from ``fd`` at ``offset`` with ``preadv`` (reused reader
-    machinery). Raises ``IOError`` on a short read (e.g. a truncated file)."""
-    n = len(mv)
-    got = 0
-    while got < n:
-        r = os.preadv(fd, [mv[got:]], offset + got)
-        if r <= 0:
-            raise IOError(f"short read: wanted {n} bytes at {offset}, got {got}")
-        got += r
+if hasattr(os, "preadv"):
+
+    def _pread_into(fd: int, offset: int, mv: memoryview) -> None:
+        """Fill ``mv`` from ``fd`` at ``offset`` with ``preadv`` (reused reader
+        machinery). Raises ``IOError`` on a short read (e.g. a truncated
+        file)."""
+        n = len(mv)
+        got = 0
+        while got < n:
+            r = os.preadv(fd, [mv[got:]], offset + got)
+            if r <= 0:
+                raise IOError(
+                    f"short read: wanted {n} bytes at {offset}, got {got}"
+                )
+            got += r
+
+else:
+
+    def _pread_into(fd: int, offset: int, mv: memoryview) -> None:
+        """Portable fallback (Windows: no ``preadv``): seek + read. Safe
+        because every fpz reader thread owns its file descriptor, so the
+        fd offset is never shared."""
+        n = len(mv)
+        got = 0
+        while got < n:
+            os.lseek(fd, offset + got, os.SEEK_SET)
+            b = os.read(fd, n - got)
+            if not b:
+                raise IOError(
+                    f"short read: wanted {n} bytes at {offset}, got {got}"
+                )
+            mv[got : got + len(b)] = b
+            got += len(b)
 
 
 def _fpz_frame_tasks(specs: list[MacroblockSpec]) -> list[tuple]:

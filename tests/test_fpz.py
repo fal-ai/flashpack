@@ -18,7 +18,7 @@ import torch
 from flashpack import serialization
 from flashpack.constants import (
     FILE_FORMAT_V3,
-    FILE_FORMAT_V4,
+    FILE_FORMAT_V5,
     FPZ_CODEC_SPLITPLANE_V1,
     FPZ_CODEC_SPLITPLANE_V2,
     FPZ_FRAME_ALIGN_BYTES,
@@ -32,15 +32,6 @@ from flashpack.deserialization import (
 )
 from flashpack.serialization import pack_to_file
 from flashpack.utils import require_zstandard
-
-# The fpz read paths pull bytes with os.preadv (POSIX-only), matching the
-# repo's O_DIRECT reader; the format targets Linux GPU fleets. Encoder and
-# reader are exercised on Linux/macOS.
-pytestmark = pytest.mark.skipif(
-    not hasattr(os, "preadv"),
-    reason="fpz read paths require os.preadv (POSIX-only)",
-)
-
 
 def _bf16_state_dict() -> dict[str, torch.Tensor]:
     generator = torch.Generator().manual_seed(0)
@@ -86,10 +77,12 @@ def test_bf16_roundtrip_is_bit_identical(tmp_path) -> None:
         )
 
 
-def test_compressed_file_is_v4_with_fpz_record(tmp_path) -> None:
+def test_compressed_file_is_v5_with_fpz_record(tmp_path) -> None:
+    # Compressed packs get a bumped top-level version so released v4-only
+    # readers reject them instead of mmapping compressed bytes as weights.
     comp = _pack(tmp_path, _bf16_state_dict(), "comp.flashpack", compress="fpz-bf16")
     meta = get_flashpack_file_metadata(comp)
-    assert meta["format"] == FILE_FORMAT_V4
+    assert meta["format"] == FILE_FORMAT_V5
     (block,) = meta["macroblocks"]
     assert block["fpz"]["codec"] == FPZ_CODEC_SPLITPLANE_V2
     assert len(block["fpz"]["frames"]) >= 1
@@ -97,6 +90,18 @@ def test_compressed_file_is_v4_with_fpz_record(tmp_path) -> None:
     assert block["fpz"]["frames"][0]["hi_chunks"]
     # length_elems stays logical; length_bytes is the smaller on-disk payload.
     assert block["length_bytes"] < block["length_elems"] * 2
+
+
+def test_unknown_format_version_fails_closed(tmp_path) -> None:
+    # An old reader's whitelist (this same check, minus v5) must raise on a
+    # newer pack, never mmap it. Prove the property by patching the footer to
+    # a same-length future version string.
+    comp = _pack(tmp_path, _bf16_state_dict(), "comp.flashpack", compress="fpz-bf16")
+    raw = open(comp, "rb").read()
+    assert raw.count(b"flashpack_v5") == 1
+    open(comp, "wb").write(raw.replace(b"flashpack_v5", b"flashpack_v9"))
+    with pytest.raises(ValueError, match="Unexpected format"):
+        get_flashpack_file_metadata(comp)
 
 
 def test_low_entropy_tensor_shrinks_file(tmp_path) -> None:
@@ -120,7 +125,7 @@ def test_mixed_dtype_only_bf16_compressed(tmp_path) -> None:
     comp = _pack(tmp_path, source, "comp.flashpack", compress="fpz-bf16")
 
     meta = get_flashpack_file_metadata(comp)
-    assert meta["format"] == FILE_FORMAT_V4
+    assert meta["format"] == FILE_FORMAT_V5
     by_dtype = {b["dtype"]: b for b in meta["macroblocks"]}
     assert "fpz" in by_dtype["bfloat16"]
     assert "fpz" not in by_dtype["float32"]

@@ -22,15 +22,6 @@ from flashpack.deserialization import (
 )
 from flashpack.serialization import pack_to_file
 
-# The fpz read paths pull bytes with os.preadv (POSIX-only), matching the
-# repo's O_DIRECT reader; the format targets Linux GPU fleets. Encoder and
-# reader are exercised on Linux/macOS.
-pytestmark = pytest.mark.skipif(
-    not hasattr(os, "preadv"),
-    reason="fpz read paths require os.preadv (POSIX-only)",
-)
-
-
 def _frame_task(block_idx: int, n_out: int, out_pos: int = 0) -> tuple:
     # Matches _fpz_frame_tasks' ("frame", block_idx, frame, out_pos) shape.
     return ("frame", block_idx, {"n_out": n_out, "payload_off": 0}, out_pos)

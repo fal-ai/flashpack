@@ -5,6 +5,10 @@ U64LE = struct.Struct("<Q")  # little-endian uint64
 
 FILE_FORMAT_V3 = "flashpack_v3"
 FILE_FORMAT_V4 = "flashpack_v4"
+# v5 = the v4 layout with one or more fpz-compressed macroblocks. A separate
+# top-level version so released v4-only readers fail closed ("Unexpected
+# format") instead of mmapping compressed bytes as weights.
+FILE_FORMAT_V5 = "flashpack_v5"
 
 DEFAULT_ALIGN_BYTES = 128
 DEFAULT_NUM_WRITE_WORKERS = 32

@@ -14,6 +14,7 @@ from .constants import (
     DEFAULT_ZSTD_LEVEL,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
+    FILE_FORMAT_V5,
     FPZ_CODEC_SPLITPLANE_V1,
     FPZ_CODEC_SPLITPLANE_V2,
     FPZ_COMPRESS_BF16,
@@ -714,7 +715,14 @@ def _write_fpz_pack_streaming(
 
             total_payload_bytes = f.tell()
             meta_payload = {
-                "format": FILE_FORMAT_V4,
+                # Compressed packs get their own top-level version: a released
+                # v4-only reader would ignore the "fpz" keys and mmap logical
+                # lengths from compressed offsets, silently reading garbage.
+                "format": (
+                    FILE_FORMAT_V5
+                    if any("fpz" in r for r in macroblock_records)
+                    else FILE_FORMAT_V4
+                ),
                 "align_bytes": int(align_bytes),
                 "total_payload_bytes": int(total_payload_bytes),
                 "total_elems": sum(block.total_elems for block in macroblocks),
