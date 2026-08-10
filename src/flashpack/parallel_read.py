@@ -41,6 +41,8 @@ Tunables (environment):
 - ``FLASHPACK_READ_CHUNK_BYTES``     chunk size (default 64 MiB)
 - ``FLASHPACK_DIRECT_IO=0``          never use O_DIRECT
 - ``FLASHPACK_CACHE_PINNED=0``       free pinned staging buffers after load (CUDA)
+- ``FLASHPACK_SAMPLE_PROBE=0``       trust mincore alone for the O_DIRECT gate
+- ``FLASHPACK_SAMPLE_PROBE_MIN_GBPS``  hot threshold for the sample probe (default 5.0)
 """
 
 import ctypes
@@ -48,6 +50,7 @@ import mmap as mmap_module
 import os
 import queue
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -188,6 +191,81 @@ def _page_cache_resident_fraction(path: str, size: int) -> float:
         return 0.0
 
 
+_SAMPLE_PROBE_THREADS = 4
+_SAMPLE_PROBE_BYTES = 16 * 1024 * 1024
+
+
+def _sample_read_gbps(path: str, size: int) -> float:
+    """Aggregate buffered read rate over samples spread across the file
+    (GB/s; 0.0 on any failure).
+
+    Discriminates page-hot from cache-cold where mincore cannot: hot files
+    scale with reader threads (well above 5 GB/s aggregate), while cold
+    network/NVMe-cache buffered reads saturate around 2-4 GB/s regardless
+    of thread count. Cost: at most 64 MiB of buffered reads, which land in
+    the page cache and are not wasted.
+    """
+    if size <= _SAMPLE_PROBE_THREADS * _SAMPLE_PROBE_BYTES:
+        # Small file: buffered is the right choice either way.
+        return float("inf")
+    try:
+        results = [0] * _SAMPLE_PROBE_THREADS
+        step = (size - _SAMPLE_PROBE_BYTES) // (_SAMPLE_PROBE_THREADS - 1)
+
+        def _sampler(idx: int) -> None:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                off = (idx * step) & ~(_ALIGN - 1)
+                want = min(_SAMPLE_PROBE_BYTES, size - off)
+                buf = bytearray(want)
+                got = os.preadv(fd, [buf], off)
+                results[idx] = max(got, 0)
+            finally:
+                os.close(fd)
+
+        threads = [
+            threading.Thread(target=_sampler, args=(i,), daemon=True)
+            for i in range(_SAMPLE_PROBE_THREADS)
+        ]
+        t0 = time.perf_counter()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        dt = time.perf_counter() - t0
+        total = sum(results)
+        if dt <= 0 or total == 0:
+            return 0.0
+        return total / 1e9 / dt
+    except Exception:
+        return 0.0
+
+
+def _sample_probe_min_gbps() -> float:
+    try:
+        return float(os.environ.get("FLASHPACK_SAMPLE_PROBE_MIN_GBPS", "5.0"))
+    except ValueError:
+        return 5.0
+
+
+def _should_use_direct(path: str, size: int) -> bool:
+    """Decide O_DIRECT vs buffered for this load.
+
+    mincore is the fast positive signal, but under cgroup-managed runners it
+    can report 0.0 residency for a demonstrably hot page cache (measured:
+    buffered repeat rode the cache at 21.6 GB/s right after mincore read 0.0),
+    which silently forces every warm reload onto the ~2x-slower direct path.
+    A timed sample read verifies coldness before O_DIRECT is chosen.
+    """
+    if not (_env_flag("FLASHPACK_DIRECT_IO") and hasattr(os, "O_DIRECT")):
+        return False
+    if _page_cache_resident_fraction(path, size) >= 0.9:
+        return False
+    if not _env_flag("FLASHPACK_SAMPLE_PROBE", default=True):
+        return True
+    return _sample_read_gbps(path, size) < _sample_probe_min_gbps()
+
+
 def _read_chunk(fd_direct, fd_plain: int, view, f_off: int, ln: int) -> None:
     """Fill ``view[:ln]`` from file offset ``f_off``.
 
@@ -270,11 +348,7 @@ def _parallel_read_into_cpu_storage(
         work.put(None)
 
     size = os.path.getsize(path)
-    use_direct = (
-        _env_flag("FLASHPACK_DIRECT_IO")
-        and hasattr(os, "O_DIRECT")
-        and _page_cache_resident_fraction(path, size) < 0.9
-    )
+    use_direct = _should_use_direct(path, size)
 
     errors: list[BaseException] = []
 
@@ -358,13 +432,9 @@ def parallel_read_into_storage(
         work.put(None)
 
     size = os.path.getsize(path)
-    use_direct = (
-        _env_flag("FLASHPACK_DIRECT_IO")
-        and hasattr(os, "O_DIRECT")
-        # A page-cache-hot file is faster through buffered reads; O_DIRECT
-        # would bypass the cache and re-fetch from the filesystem.
-        and _page_cache_resident_fraction(path, size) < 0.9
-    )
+    # A page-cache-hot file is faster through buffered reads; O_DIRECT
+    # would bypass the cache and re-fetch from the filesystem.
+    use_direct = _should_use_direct(path, size)
 
     pool = _get_pinned_pool(n_threads, chunk_bytes)
     errors: list[BaseException] = []
