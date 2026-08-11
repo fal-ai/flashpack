@@ -27,6 +27,7 @@ from .constants import (
 from .parallel_read import (
     parallel_read_into_storage,
     parallel_read_supported,
+    sharded_read_available,
 )
 from .utils import (
     get_module_and_attribute,
@@ -349,8 +350,66 @@ def _shard_bytes_from_env() -> int:
     try:
         value = int(raw)
     except ValueError:
+        warnings.warn(
+            f"ignoring malformed FLASHPACK_SHARD_BYTES={raw!r}; "
+            f"using default {DEFAULT_SHARD_BYTES}",
+            stacklevel=2,
+        )
         return DEFAULT_SHARD_BYTES
     return max(SHARD_ALIGN_BYTES, value)
+
+
+def _agree_sharded_config(
+    strategy: str | None, device: torch.device
+) -> tuple[bool, str, int]:
+    """Resolve the sharded-read configuration on rank 0 and broadcast it.
+
+    Returns ``(use_sharded, strategy, shard_bytes)``, identical on every rank
+    by construction. The collective schedule downstream is a pure function of
+    this configuration, so it MUST NOT be derived from per-rank environment:
+    ``FLASHPACK_SHARD_STRATEGY`` / ``FLASHPACK_SHARD_BYTES`` /
+    ``FLASHPACK_PARALLEL_READ`` set on a subset of ranks would otherwise make
+    ranks issue mismatched collectives (undefined NCCL behavior). Rank 0's
+    environment is authoritative; other ranks' env is ignored for these knobs.
+
+    ``use_sharded`` is False when rank 0's host cannot run the sharded reader
+    (non-POSIX, or the ``FLASHPACK_PARALLEL_READ=0`` kill switch) -- the
+    caller then falls back to rank-``src`` mode everywhere, keeping the kill
+    switch effective for sharded loads without desynchronizing anything.
+
+    A resolution failure on rank 0 (unknown strategy name) is broadcast as a
+    sentinel so every rank raises together instead of rank 0 unwinding while
+    its peers wait in the config broadcast.
+
+    Wire format (int64[2], broadcast from rank 0):
+      cfg[0]: -1 resolution failed | 0 fall back to rank-src | 1+i strategy i
+      cfg[1]: shard_bytes
+    """
+    rank = dist.get_rank()
+    cfg = torch.zeros(2, dtype=torch.int64, device=device)
+    local_error: BaseException | None = None
+    if rank == 0:
+        try:
+            if not sharded_read_available():
+                cfg[0] = 0
+            else:
+                resolved = resolve_shard_strategy(strategy)
+                cfg[0] = 1 + SHARD_STRATEGIES.index(resolved)
+                cfg[1] = _shard_bytes_from_env()
+        except BaseException as exc:  # noqa: BLE001 - re-raised, synchronized
+            local_error = exc
+            cfg[0] = -1
+    dist.broadcast(cfg, src=0)
+    code = int(cfg[0].item())
+    if code < 0:
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError(
+            "sharded flashpack load: configuration resolution failed on rank 0"
+        )
+    if code == 0:
+        return False, "", 0
+    return True, SHARD_STRATEGIES[code - 1], int(cfg[1].item())
 
 
 def _shard_range(
@@ -416,9 +475,11 @@ def _plan_windows(
     of them) and, when the macroblock's own file offset is aligned, on a 4096
     file offset too -- see ``_read_storage_sharded`` on the unaligned case.
 
-    The plan is a pure function of the pack metadata and ``world``, so every
-    rank derives an identical window list and therefore issues an identical
-    collective sequence.
+    The plan is a pure function of ``(specs, world, shard_bytes)``. For the
+    collective sequence to match across ranks, ``shard_bytes`` must therefore
+    be identical everywhere -- which is why the distributed entry point agrees
+    on it via rank-0 broadcast (``_agree_sharded_config``) instead of letting
+    each rank read its own environment.
     """
     windows: list[_Window] = []
     for block_idx, spec in enumerate(specs):
@@ -440,13 +501,11 @@ def _plan_windows(
 def _all_gather_into(output: torch.Tensor, input_: torch.Tensor) -> None:
     """AllGather ``input_`` from every rank into ``output``.
 
-    torch renamed this collective: ``all_gather_into_tensor`` is deprecated in
-    favour of ``all_gather_single`` (which does not exist on the older torch
-    this package still supports), so prefer the new name when present and fall
-    back to the old one otherwise.
+    ``all_gather_into_tensor`` is the current name of this collective (it
+    replaced the deprecated ``_all_gather_base``) and exists on every torch
+    this package supports (>= 2.0), so it is called directly.
     """
-    fn = getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor
-    fn(output, input_)
+    dist.all_gather_into_tensor(output, input_)
 
 
 _inplace_allgather_ok: dict[tuple[str, str], bool] = {}
@@ -474,12 +533,18 @@ def _supports_inplace_allgather(device: torch.device) -> bool:
 
     world = dist.get_world_size()
     rank = dist.get_rank()
+    # int32, not uint8: rank + 1 overflows uint8 at world >= 255, and the
+    # resulting mismatched expectations would deadlock the MIN-reduce path.
+    # Allocated OUTSIDE the try so a rank cannot fail before issuing the probe
+    # collective while its peers sit inside it (32 + 4 bytes per rank; if this
+    # allocation fails the process has no workable device at all).
+    probe = torch.zeros(world * 8, dtype=torch.int32, device=device)
+    expect = torch.arange(1, world + 1, dtype=torch.int32, device=device)
+    verdict = torch.zeros(1, dtype=torch.int32, device=device)
     ok = True
     try:
-        probe = torch.zeros(world * 8, dtype=torch.uint8, device=device)
         probe.narrow(0, rank * 8, 8).fill_(rank + 1)
         _all_gather_into(probe, probe.narrow(0, rank * 8, 8))
-        expect = torch.arange(1, world + 1, dtype=torch.uint8, device=device)
         seen = probe.view(world, 8)
         ok = bool(
             torch.equal(seen.min(dim=1).values, expect)
@@ -487,7 +552,7 @@ def _supports_inplace_allgather(device: torch.device) -> bool:
         )
     except Exception:
         ok = False
-    verdict = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
+    verdict.fill_(1 if ok else 0)
     dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
     _inplace_allgather_ok[cache_key] = bool(verdict.item())
     return _inplace_allgather_ok[cache_key]
@@ -590,11 +655,15 @@ def _replicate_contiguous(
 def _read_storage_sharded(
     path: str,
     specs: list[MacroblockSpec],
-    storage: FlashTensorStorage,
     device: torch.device,
-    strategy: str | None = None,
-) -> None:
+    strategy: str,
+    shard_bytes: int,
+) -> FlashTensorStorage:
     """Every rank reads its own 1/N of the payload, then it is replicated.
+
+    ``strategy`` and ``shard_bytes`` come pre-agreed from
+    ``_agree_sharded_config`` -- never from per-rank environment -- so every
+    rank derives the identical plan and collective sequence.
 
     Total disk bytes stay one pack-read, but the read wall drops toward
     ``read_time / world`` because the ranks read disjoint ranges concurrently --
@@ -621,50 +690,60 @@ def _read_storage_sharded(
     difference is expected to matter at other pack sizes, world sizes, and
     fabrics, so both ship and either can be selected.
 
-    Either way, a rank whose read fails still issues the rest of its collectives
-    before raising, so a one-rank IO error surfaces as a synchronized exception
-    instead of leaving the other ranks blocked in a collective forever.
+    Failure handling is agreement-first: storage allocation, shard planning,
+    and the shard read all run inside a synchronized envelope; ranks then agree
+    (one tiny all_reduce) on whether anyone failed BEFORE any data collective
+    is issued. A rank-local failure -- CUDA OOM allocating the full pack (the
+    likeliest production failure), an IO error mid-read -- therefore surfaces
+    as a synchronized exception on every rank, instead of leaving the peers
+    blocked in a broadcast/AllGather forever. Agreement-first also means a
+    failed load never moves garbage bytes over the fabric.
     """
-    strategy = resolve_shard_strategy(strategy)
     world = dist.get_world_size()
     rank = dist.get_rank()
+
+    # The agreement flag is allocated before anything fallible so the
+    # agreement collective itself can always be issued (4 bytes; if this
+    # fails the process has no workable device at all).
+    failed = torch.zeros(1, dtype=torch.int32, device=device)
 
     # Sub-specs go through the existing reader, whose chunk planner realigns to
     # 4096 in *file* space (reading any sub-page head buffered). So a macroblock
     # whose own offset_bytes is unaligned -- fp8-static packs put a bf16 block
     # ahead of the quantized one -- costs one short buffered read per shard
     # rather than losing O_DIRECT.
+    local_error: BaseException | None = None
+    storage: FlashTensorStorage | None = None
     windows: list[_Window] = []
-    if strategy == SHARD_STRATEGY_WINDOWS:
-        sub_specs, sub_blocks, windows = _sub_specs_windows(
-            specs, storage, world, rank, _shard_bytes_from_env()
-        )
-    else:
-        sub_specs, sub_blocks = _sub_specs_contiguous(specs, storage, world, rank)
-
-    read_error: BaseException | None = None
-    if sub_specs:
-        try:
+    try:
+        storage = _allocate_empty_storage(specs, device)
+        if strategy == SHARD_STRATEGY_WINDOWS:
+            sub_specs, sub_blocks, windows = _sub_specs_windows(
+                specs, storage, world, rank, shard_bytes
+            )
+        else:
+            sub_specs, sub_blocks = _sub_specs_contiguous(specs, storage, world, rank)
+        if sub_specs:
             parallel_read_into_storage(path, sub_specs, sub_blocks, device)
-        except BaseException as exc:  # noqa: BLE001 - re-raised, synchronized
-            read_error = exc
+    except BaseException as exc:  # noqa: BLE001 - re-raised, synchronized
+        local_error = exc
+        failed.fill_(1)
+
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if failed.item():
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError(
+            f"sharded flashpack load of {path} failed on another rank "
+            f"(rank {rank} allocated and read its own shards successfully)"
+        )
+    assert storage is not None  # failed==0 implies every rank allocated
 
     if strategy == SHARD_STRATEGY_WINDOWS:
         _replicate_windows(windows, storage, world, rank, device)
     else:
         _replicate_contiguous(specs, storage, world)
-
-    failed = torch.tensor(
-        [1 if read_error is not None else 0], dtype=torch.int32, device=device
-    )
-    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-    if failed.item():
-        if read_error is not None:
-            raise read_error
-        raise RuntimeError(
-            f"sharded flashpack load of {path} failed on another rank "
-            f"(rank {rank} read its own shards successfully)"
-        )
+    return storage
 
 
 def read_flashpack_file(
@@ -749,11 +828,16 @@ def read_flashpack_file_distributed(
     filesystem rates. ``shard_strategy`` selects how -- ``"contiguous"`` (one
     slab per rank, owner-broadcasts) or ``"windows"`` (interleaved superwindows,
     one AllGather each); see ``_read_storage_sharded``. ``None`` takes
-    ``FLASHPACK_SHARD_STRATEGY``, else the package default. Requires every rank
-    to be able to read the pack payload from ``path`` (rank-``src`` mode only
-    needs the footer on non-src ranks). Falls back to rank-``src`` mode for
-    packs with compressed (fpz) blocks, whose on-disk bytes are not
-    shard-addressable.
+    ``FLASHPACK_SHARD_STRATEGY``, else the package default. The sharded
+    configuration (strategy, window size, host capability) is resolved on
+    rank 0 and broadcast, so rank 0's environment is authoritative and a knob
+    set on a subset of ranks cannot desynchronize the collective schedule.
+    Requires every rank to be able to read the pack payload from ``path``
+    (rank-``src`` mode only needs the footer on non-src ranks). Falls back to
+    rank-``src`` mode for packs with compressed (fpz) blocks, whose on-disk
+    bytes are not shard-addressable, and when the parallel reader is
+    unavailable (non-POSIX hosts, or the ``FLASHPACK_PARALLEL_READ=0`` kill
+    switch -- which thereby applies to sharded loads too).
 
     This removes the N-times read amplification of world-size-N loads: the
     reader deliberately bypasses the page cache (O_DIRECT), so without this
@@ -781,10 +865,19 @@ def read_flashpack_file_distributed(
     if sharded and any("fpz" in block for block in meta.get("macroblocks", []) or []):
         sharded = False  # compressed payload bytes are not shard-addressable
     if sharded and dist.get_world_size() > 1:
-        specs = _build_macroblock_specs(meta)
-        storage = _allocate_empty_storage(specs, device)
-        _read_storage_sharded(path, specs, storage, device, shard_strategy)
-        return storage, meta
+        # Rank 0 resolves the whole sharded configuration (strategy, window
+        # size, host capability incl. the FLASHPACK_PARALLEL_READ kill switch)
+        # and broadcasts it, so divergent per-rank environment cannot make
+        # ranks issue mismatched collectives. use_sharded=False here means
+        # rank 0's host cannot run the sharded reader -- fall back to
+        # rank-``src`` mode on every rank.
+        use_sharded, strategy, shard_bytes = _agree_sharded_config(
+            shard_strategy, device
+        )
+        if use_sharded:
+            specs = _build_macroblock_specs(meta)
+            storage = _read_storage_sharded(path, specs, device, strategy, shard_bytes)
+            return storage, meta
     if dist.get_rank() == src:
         storage, meta = read_flashpack_file(
             path=path,
