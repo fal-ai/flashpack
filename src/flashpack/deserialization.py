@@ -14,9 +14,11 @@ import tqdm
 from .constants import (
     DEFAULT_CHUNK_BYTES,
     DEFAULT_NUM_STREAMS,
+    DEFAULT_SHARD_BYTES,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
     MAGIC,
+    SHARD_ALIGN_BYTES,
     U64LE,
 )
 from .parallel_read import (
@@ -318,24 +320,120 @@ def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
         dist.broadcast(block.view(torch.uint8), src=src)
 
 
-def _shard_range(
-    length_bytes: int, world: int, rank: int, align: int = 4096
-) -> tuple[int, int]:
-    """Byte range ``[lo, hi)`` of rank ``rank``'s shard of a block.
+@dataclass(frozen=True)
+class _Window:
+    """One superwindow of a macroblock.
 
-    Boundaries are rounded down to ``align`` so every shard start satisfies
-    the reader's O_DIRECT file-offset requirement, and (because 4096 is a
-    multiple of every element size flashpack stores) always falls on an
-    element boundary. Blocks smaller than ``world * align`` leave the high
-    ranks with empty ranges -- callers skip those consistently, so the
-    collective call order stays identical on every rank.
+    ``world`` equal shards of ``shard_bytes`` tile ``[base, base + span)`` of
+    macroblock ``block``, and rank ``r`` owns shard ``r``. ``shard_bytes == 0``
+    marks a sub-``world * align`` remainder that every rank reads itself --
+    below that size a collective costs more than the duplicate read.
     """
-    if length_bytes <= 0:
-        return (0, 0)
-    per = length_bytes / world
-    lo = int(per * rank) // align * align
-    hi = int(per * (rank + 1)) // align * align if rank + 1 < world else length_bytes
-    return (min(lo, length_bytes), min(max(hi, lo), length_bytes))
+
+    block: int
+    base: int
+    shard_bytes: int
+    span: int
+
+
+def _plan_windows(
+    specs: list[MacroblockSpec],
+    world: int,
+    shard_bytes: int = DEFAULT_SHARD_BYTES,
+    align: int = SHARD_ALIGN_BYTES,
+) -> list[_Window]:
+    """Tile every macroblock with interleaved superwindows.
+
+    Rank ``r`` reads ``[base + r*C, base + (r+1)*C)`` of each window rather
+    than one contiguous ``length/world`` slab. Interleaving keeps every rank's
+    shard of a given window equal-sized, which is what lets the window be
+    replicated with a single AllGather instead of ``world`` broadcasts, and it
+    bounds the work in flight to one window at a time.
+
+    Shard sizes step down geometrically (``C``, ``C/2``, ...) so a remainder
+    never forces a multi-hundred-MB duplicate read on every rank; only the last
+    sub-``world * align`` bytes are read redundantly.
+
+    Every boundary is ``align``-aligned, so each shard starts on an element
+    boundary for every dtype flashpack stores (``align`` is a multiple of all
+    of them) and, when the macroblock's own file offset is aligned, on a 4096
+    file offset too -- see ``_read_storage_sharded`` on the unaligned case.
+
+    The plan is a pure function of the pack metadata and ``world``, so every
+    rank derives an identical window list and therefore issues an identical
+    collective sequence.
+    """
+    windows: list[_Window] = []
+    for block_idx, spec in enumerate(specs):
+        pos = 0
+        n = int(spec.length_bytes)
+        shard = max(align, shard_bytes - (shard_bytes % align))
+        while shard >= align:
+            span = world * shard
+            while n - pos >= span:
+                windows.append(_Window(block_idx, pos, shard, span))
+                pos += span
+            shard //= 2
+            shard -= shard % align
+        if pos < n:
+            windows.append(_Window(block_idx, pos, 0, n - pos))
+    return windows
+
+
+def _all_gather_into(output: torch.Tensor, input_: torch.Tensor) -> None:
+    """AllGather ``input_`` from every rank into ``output``.
+
+    torch renamed this collective: ``all_gather_into_tensor`` is deprecated in
+    favour of ``all_gather_single`` (which does not exist on the older torch
+    this package still supports), so prefer the new name when present and fall
+    back to the old one otherwise.
+    """
+    fn = getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor
+    fn(output, input_)
+
+
+_inplace_allgather_ok: dict[tuple[str, str], bool] = {}
+
+
+def _supports_inplace_allgather(device: torch.device) -> bool:
+    """Whether an in-place AllGather -- input aliasing the rank's own slice of
+    the output -- both runs and produces the right bytes here.
+
+    NCCL documents this rank-offset arrangement as in-place, which is what lets
+    each rank read straight into its slot of the destination with no separate
+    gather buffer. A backend that instead returns garbage would corrupt weights
+    with nothing downstream to catch it, so this verifies the *result* on a tiny
+    buffer once and falls back to staging the shard when it does not hold. The
+    verdict is reduced across ranks so every rank takes the same path.
+
+    Cached per (backend, device kind): one process can load over gloo/CPU and
+    later over NCCL/CUDA, and the answer belongs to the transport, not the
+    process.
+    """
+    cache_key = (dist.get_backend(), device.type)
+    cached = _inplace_allgather_ok.get(cache_key)
+    if cached is not None:
+        return cached
+
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    ok = True
+    try:
+        probe = torch.zeros(world * 8, dtype=torch.uint8, device=device)
+        probe.narrow(0, rank * 8, 8).fill_(rank + 1)
+        _all_gather_into(probe, probe.narrow(0, rank * 8, 8))
+        expect = torch.arange(1, world + 1, dtype=torch.uint8, device=device)
+        seen = probe.view(world, 8)
+        ok = bool(
+            torch.equal(seen.min(dim=1).values, expect)
+            and torch.equal(seen.max(dim=1).values, expect)
+        )
+    except Exception:
+        ok = False
+    verdict = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+    _inplace_allgather_ok[cache_key] = bool(verdict.item())
+    return _inplace_allgather_ok[cache_key]
 
 
 def _read_storage_sharded(
@@ -344,49 +442,79 @@ def _read_storage_sharded(
     storage: FlashTensorStorage,
     device: torch.device,
 ) -> None:
-    """Every rank reads its 1/N byte shard of each block, then each shard is
-    broadcast from its owner: total disk bytes moved stay one pack-read, but
-    the read wall drops toward ``read_time / world`` because ranks read in
-    parallel, and the interleaved broadcasts run at NVLink rates.
-    """
-    from .parallel_read import parallel_read_into_storage
+    """Every rank reads its shard of each superwindow, then one AllGather per
+    window replicates it.
 
+    Total disk bytes stay one pack-read, but the read wall drops toward
+    ``read_time / world`` because the ranks read disjoint ranges concurrently --
+    which also multiplies the request parallelism the filesystem sees, the part
+    that matters most on a network FS whose cold throughput is per-client.
+
+    Replication uses AllGather rather than ``world`` owner-broadcasts: it is the
+    primitive for this pattern (every rank contributes one shard and receives
+    the rest), it is one op per window instead of ``world`` ops, and it is what
+    NCCL's copy-engine and NVLink-multicast fast paths are implemented for.
+
+    A rank whose read fails still issues the rest of its collectives before
+    raising, so a one-rank IO error surfaces as a synchronized exception instead
+    of leaving the other ranks blocked in a collective forever.
+    """
     world = dist.get_world_size()
     rank = dist.get_rank()
+    windows = _plan_windows(specs, world)
 
+    # Each rank's own shards, as sub-specs the existing reader can consume. Its
+    # chunk planner realigns to 4096 in *file* space (reading any sub-page head
+    # buffered), so a macroblock whose own offset_bytes is unaligned -- fp8
+    # static packs interleave a bf16 block ahead of the quantized one -- costs
+    # one short buffered read per shard rather than losing O_DIRECT.
     sub_specs: list[MacroblockSpec] = []
     sub_blocks: list[torch.Tensor] = []
-    for spec, block in zip(specs, storage.blocks):
-        lo, hi = _shard_range(spec.length_bytes, world, rank)
-        if hi <= lo:
-            continue
+    for window in windows:
+        spec = specs[window.block]
+        block = storage.blocks[window.block]
         elem = block.element_size()
+        lo = window.base + rank * window.shard_bytes
+        length = window.shard_bytes or window.span
         sub_specs.append(
             MacroblockSpec(
                 dtype=spec.dtype,
                 offset_bytes=spec.offset_bytes + lo,
-                length_bytes=hi - lo,
-                length_elems=(hi - lo) // elem,
+                length_bytes=length,
+                length_elems=length // elem,
             )
         )
-        sub_blocks.append(block.narrow(0, lo // elem, (hi - lo) // elem))
-    if sub_specs:
-        parallel_read_into_storage(path, sub_specs, sub_blocks, device)
+        sub_blocks.append(block.narrow(0, lo // elem, length // elem))
 
-    # Interleaved owner broadcasts, identical op order on every rank. Each
-    # broadcast is issued async so rank i's send of shard i overlaps the
-    # remaining collectives on the backend stream.
-    works = []
-    for src_rank in range(world):
-        for spec, block in zip(specs, storage.blocks):
-            lo, hi = _shard_range(spec.length_bytes, world, src_rank)
-            if hi <= lo:
-                continue
-            elem = block.element_size()
-            view = block.narrow(0, lo // elem, (hi - lo) // elem).view(torch.uint8)
-            works.append(dist.broadcast(view, src=src_rank, async_op=True))
-    for w in works:
-        w.wait()
+    read_error: BaseException | None = None
+    if sub_specs:
+        try:
+            parallel_read_into_storage(path, sub_specs, sub_blocks, device)
+        except BaseException as exc:  # noqa: BLE001 - re-raised, synchronized
+            read_error = exc
+
+    inplace = _supports_inplace_allgather(device)
+    for window in windows:
+        if not window.shard_bytes:
+            continue  # read redundantly on every rank; nothing to replicate
+        block = storage.blocks[window.block]
+        elem = block.element_size()
+        span = block.narrow(0, window.base // elem, window.span // elem)
+        span = span.view(torch.uint8)
+        shard = span.narrow(0, rank * window.shard_bytes, window.shard_bytes)
+        _all_gather_into(span, shard if inplace else shard.clone())
+
+    failed = torch.tensor(
+        [1 if read_error is not None else 0], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if failed.item():
+        if read_error is not None:
+            raise read_error
+        raise RuntimeError(
+            f"sharded flashpack load of {path} failed on another rank "
+            f"(rank {rank} read its own shards successfully)"
+        )
 
 
 def read_flashpack_file(
@@ -463,12 +591,13 @@ def read_flashpack_file_distributed(
     """Rank-``src`` reads the pack from disk; every rank returns the full
     storage, received via broadcast.
 
-    With ``sharded=True`` every rank instead reads a contiguous 1/N byte
-    shard of each block and each shard is broadcast from its owner: the same
-    one-pack-read total, but the disk wall drops toward ``read / world``
-    because ranks read in parallel. Requires every rank to be able to read
-    the pack payload from ``path`` (rank-``src`` mode only needs the footer
-    on non-src ranks). Falls back to rank-``src`` mode for packs with
+    With ``sharded=True`` every rank instead reads its own 1/N of each
+    superwindow of each block, and one AllGather per window replicates it: the
+    same one-pack-read total, but the disk wall drops toward ``read / world``
+    because the ranks read disjoint ranges concurrently, and the replication
+    runs at fabric rather than filesystem rates. Requires every rank to be able
+    to read the pack payload from ``path`` (rank-``src`` mode only needs the
+    footer on non-src ranks). Falls back to rank-``src`` mode for packs with
     compressed (fpz) blocks, whose on-disk bytes are not shard-addressable.
 
     This removes the N-times read amplification of world-size-N loads: the

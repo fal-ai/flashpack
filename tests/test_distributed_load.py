@@ -21,10 +21,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from flashpack import deserialization
 from flashpack.deserialization import (
     FlashTensorStorage,
+    MacroblockSpec,
     _broadcast_storage,
-    _shard_range,
+    _plan_windows,
     assign_from_file,
     iterate_from_flash_tensor,
     read_flashpack_file_distributed,
@@ -164,20 +166,58 @@ def test_read_distributed_requires_process_group(tmp_path) -> None:
         read_flashpack_file_distributed(pack, device="cpu")
 
 
-def test_shard_range_covers_disjoint_aligned() -> None:
-    for length in (0, 1, 4095, 4096, 8192, 67_584, 1_000_000, 40 * 1024 * 1024):
+def test_plan_windows_tiles_blocks_exactly() -> None:
+    """The window plan must tile every block with no gap or overlap, keep every
+    shard equal-sized within a window (AllGather requires that), stay 4096
+    aligned, and leave only a sub-``world * 4096`` remainder unsharded."""
+    lengths = (0, 1, 4095, 4096, 8192, 67_584, 1_000_000, 40 * 1024 * 1024)
+    for length in lengths:
         for world in (1, 2, 4, 8):
-            ranges = [_shard_range(length, world, r) for r in range(world)]
-            # disjoint, ordered, and covering exactly [0, length)
+            specs = [
+                MacroblockSpec(
+                    dtype=torch.uint8,
+                    offset_bytes=0,
+                    length_bytes=length,
+                    length_elems=length,
+                )
+            ]
+            windows = _plan_windows(specs, world, shard_bytes=8192)
             pos = 0
-            for lo, hi in ranges:
-                assert lo == pos or lo == hi  # empty shards collapse in place
-                assert lo % 4096 == 0
-                pos = max(pos, hi)
-            assert pos == length
-            # non-final boundaries land on element boundaries for all dtypes
-            for _, hi in ranges[:-1]:
-                assert hi % 4096 == 0 or hi == length
+            for window in windows:
+                assert window.base == pos, "windows must tile without gaps"
+                assert window.base % 4096 == 0
+                if window.shard_bytes:
+                    assert window.shard_bytes % 4096 == 0
+                    # equal shards, exactly covering the window
+                    assert window.span == world * window.shard_bytes
+                else:
+                    # the only unsharded remainder, and it is small
+                    assert window is windows[-1]
+                    assert window.span < world * 4096
+                pos += window.span
+            assert pos == length, "windows must cover the block exactly"
+
+    # every rank's shard of a window is disjoint and together they cover it
+    specs = [
+        MacroblockSpec(
+            dtype=torch.uint8,
+            offset_bytes=0,
+            length_bytes=1_000_000,
+            length_elems=1_000_000,
+        )
+    ]
+    for world in (2, 4, 8):
+        for window in _plan_windows(specs, world, shard_bytes=8192):
+            if not window.shard_bytes:
+                continue
+            covered = [
+                (window.base + r * window.shard_bytes, window.shard_bytes)
+                for r in range(world)
+            ]
+            assert covered[0][0] == window.base
+            assert (
+                covered[-1][0] + covered[-1][1] == window.base + window.span
+            ), "shards must cover the window"
 
 
 def _sharded_source() -> dict[str, torch.Tensor]:
@@ -217,6 +257,40 @@ def test_read_flashpack_file_distributed_sharded(tmp_path) -> None:
     mp.spawn(
         _read_sharded_worker,
         args=(str(tmp_path / "rdv4"), pack),
+        nprocs=_WORLD,
+        join=True,
+    )
+
+
+_real_inplace_probe = deserialization._supports_inplace_allgather
+
+
+def _staged_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
+    _init(rank, init_file)
+    try:
+        # gloo (and NCCL) accept the in-place gather, so the staged path -- the
+        # fallback for a backend that does not -- would otherwise never run.
+        # Force it and require byte-identical results from it too.
+        deserialization._supports_inplace_allgather = lambda device: False
+        storage, meta = read_flashpack_file_distributed(
+            pack_path, device="cpu", sharded=True
+        )
+        got = dict(iterate_from_flash_tensor(storage, meta))
+        for name, tensor in _sharded_source().items():
+            assert torch.equal(
+                got[name].view(torch.uint8), tensor.contiguous().view(torch.uint8)
+            ), f"rank {rank} {name} mismatch on the staged path"
+    finally:
+        deserialization._supports_inplace_allgather = _real_inplace_probe
+        dist.destroy_process_group()
+
+
+def test_read_sharded_staged_fallback_matches(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_sharded_source(), pack, None)
+    mp.spawn(
+        _staged_sharded_worker,
+        args=(str(tmp_path / "rdv6"), pack),
         nprocs=_WORLD,
         join=True,
     )
