@@ -22,14 +22,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from flashpack import deserialization
+from flashpack.constants import SHARD_STRATEGIES
 from flashpack.deserialization import (
     FlashTensorStorage,
     MacroblockSpec,
     _broadcast_storage,
     _plan_windows,
+    _shard_range,
     assign_from_file,
     iterate_from_flash_tensor,
     read_flashpack_file_distributed,
+    resolve_shard_strategy,
 )
 from flashpack.serialization import pack_to_file
 
@@ -166,6 +169,40 @@ def test_read_distributed_requires_process_group(tmp_path) -> None:
         read_flashpack_file_distributed(pack, device="cpu")
 
 
+def test_shard_range_covers_disjoint_aligned() -> None:
+    """The contiguous strategy's shards must tile the block, stay aligned, and
+    collapse empty for blocks too small to divide."""
+    for length in (0, 1, 4095, 4096, 8192, 67_584, 1_000_000, 40 * 1024 * 1024):
+        for world in (1, 2, 4, 8):
+            ranges = [_shard_range(length, world, r) for r in range(world)]
+            pos = 0
+            for lo, hi in ranges:
+                assert lo == pos or lo == hi  # empty shards collapse in place
+                assert lo % 4096 == 0
+                pos = max(pos, hi)
+            assert pos == length
+            for _, hi in ranges[:-1]:
+                assert hi % 4096 == 0 or hi == length
+
+
+def test_resolve_shard_strategy() -> None:
+    for name in SHARD_STRATEGIES:
+        assert resolve_shard_strategy(name) == name
+        assert resolve_shard_strategy(name.upper()) == name
+    assert resolve_shard_strategy(None) in SHARD_STRATEGIES
+    with pytest.raises(ValueError, match="unknown shard strategy"):
+        resolve_shard_strategy("sideways")
+
+
+def test_shard_strategy_env_override(monkeypatch) -> None:
+    for name in SHARD_STRATEGIES:
+        monkeypatch.setenv("FLASHPACK_SHARD_STRATEGY", name)
+        assert resolve_shard_strategy(None) == name
+        # an explicit argument still wins over the environment
+        other = next(s for s in SHARD_STRATEGIES if s != name)
+        assert resolve_shard_strategy(other) == other
+
+
 def test_plan_windows_tiles_blocks_exactly() -> None:
     """The window plan must tile every block with no gap or overlap, keep every
     shard equal-sized within a window (AllGather requires that), stay 4096
@@ -234,11 +271,13 @@ def _sharded_source() -> dict[str, torch.Tensor]:
     return state
 
 
-def _read_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
+def _read_sharded_worker(
+    rank: int, init_file: str, pack_path: str, strategy: str
+) -> None:
     _init(rank, init_file)
     try:
         storage, meta = read_flashpack_file_distributed(
-            pack_path, device="cpu", sharded=True
+            pack_path, device="cpu", sharded=True, shard_strategy=strategy
         )
         got = dict(iterate_from_flash_tensor(storage, meta))
         state = _sharded_source()
@@ -251,12 +290,14 @@ def _read_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
         dist.destroy_process_group()
 
 
-def test_read_flashpack_file_distributed_sharded(tmp_path) -> None:
+@pytest.mark.parametrize("strategy", SHARD_STRATEGIES)
+def test_read_flashpack_file_distributed_sharded(tmp_path, strategy) -> None:
+    """Both shard strategies must deliver byte-identical payloads to every rank."""
     pack = str(tmp_path / "pack.flashpack")
     pack_to_file(_sharded_source(), pack, None)
     mp.spawn(
         _read_sharded_worker,
-        args=(str(tmp_path / "rdv4"), pack),
+        args=(str(tmp_path / f"rdv4-{strategy}"), pack, strategy),
         nprocs=_WORLD,
         join=True,
     )
@@ -296,7 +337,9 @@ def test_read_sharded_staged_fallback_matches(tmp_path) -> None:
     )
 
 
-def _assign_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
+def _assign_sharded_worker(
+    rank: int, init_file: str, pack_path: str, strategy: str
+) -> None:
     _init(rank, init_file)
     try:
         model = _TwoParam()
@@ -306,6 +349,7 @@ def _assign_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
             device="cpu",
             use_distributed_loading=True,
             distributed_sharded=True,
+            distributed_shard_strategy=strategy,
         )
         state = _source_state()
         assert torch.equal(model.a.data, state["a"]), f"rank {rank} a mismatch"
@@ -314,12 +358,13 @@ def _assign_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
         dist.destroy_process_group()
 
 
-def test_assign_from_file_distributed_sharded(tmp_path) -> None:
+@pytest.mark.parametrize("strategy", SHARD_STRATEGIES)
+def test_assign_from_file_distributed_sharded(tmp_path, strategy) -> None:
     pack = str(tmp_path / "pack.flashpack")
     pack_to_file(_source_state(), pack, None)
     mp.spawn(
         _assign_sharded_worker,
-        args=(str(tmp_path / "rdv5"), pack),
+        args=(str(tmp_path / f"rdv5-{strategy}"), pack, strategy),
         nprocs=_WORLD,
         join=True,
     )

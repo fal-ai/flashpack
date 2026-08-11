@@ -15,10 +15,13 @@ from .constants import (
     DEFAULT_CHUNK_BYTES,
     DEFAULT_NUM_STREAMS,
     DEFAULT_SHARD_BYTES,
+    DEFAULT_SHARD_STRATEGY,
     FILE_FORMAT_V3,
     FILE_FORMAT_V4,
     MAGIC,
     SHARD_ALIGN_BYTES,
+    SHARD_STRATEGIES,
+    SHARD_STRATEGY_WINDOWS,
     U64LE,
 )
 from .parallel_read import (
@@ -320,6 +323,60 @@ def _broadcast_storage(storage: FlashTensorStorage, src: int) -> None:
         dist.broadcast(block.view(torch.uint8), src=src)
 
 
+def resolve_shard_strategy(strategy: str | None = None) -> str:
+    """Validate/resolve a sharded-read strategy name.
+
+    ``None`` takes ``FLASHPACK_SHARD_STRATEGY`` if set, else
+    ``DEFAULT_SHARD_STRATEGY``, so a deployment can flip strategies without a
+    code change while an explicit argument still wins.
+    """
+    if strategy is None:
+        strategy = os.environ.get("FLASHPACK_SHARD_STRATEGY") or DEFAULT_SHARD_STRATEGY
+    strategy = strategy.strip().lower()
+    if strategy not in SHARD_STRATEGIES:
+        raise ValueError(
+            f"unknown shard strategy {strategy!r}; expected one of "
+            f"{', '.join(sorted(SHARD_STRATEGIES))}"
+        )
+    return strategy
+
+
+def _shard_bytes_from_env() -> int:
+    """Superwindow shard size, overridable for tuning per pack/fabric."""
+    raw = os.environ.get("FLASHPACK_SHARD_BYTES")
+    if not raw:
+        return DEFAULT_SHARD_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_SHARD_BYTES
+    return max(SHARD_ALIGN_BYTES, value)
+
+
+def _shard_range(
+    length_bytes: int, world: int, rank: int, align: int = SHARD_ALIGN_BYTES
+) -> tuple[int, int]:
+    """Byte range ``[lo, hi)`` of rank ``rank``'s contiguous shard of a block.
+
+    Boundaries are rounded down to ``align``, which is a multiple of every
+    element size flashpack stores, so a shard always starts on an element
+    boundary. Note this aligns within the *block*: the read offset is
+    ``spec.offset_bytes + lo``, and a macroblock's own offset need not be
+    aligned, in which case the reader's chunk planner recovers alignment after
+    one short buffered head rather than losing O_DIRECT.
+
+    Blocks smaller than ``world * align`` leave the high ranks with empty ranges
+    -- callers skip those consistently, so the collective call order stays
+    identical on every rank.
+    """
+    if length_bytes <= 0:
+        return (0, 0)
+    per = length_bytes / world
+    lo = int(per * rank) // align * align
+    hi = int(per * (rank + 1)) // align * align if rank + 1 < world else length_bytes
+    return (min(lo, length_bytes), min(max(hi, lo), length_bytes))
+
+
 @dataclass(frozen=True)
 class _Window:
     """One superwindow of a macroblock.
@@ -436,38 +493,15 @@ def _supports_inplace_allgather(device: torch.device) -> bool:
     return _inplace_allgather_ok[cache_key]
 
 
-def _read_storage_sharded(
-    path: str,
+def _sub_specs_windows(
     specs: list[MacroblockSpec],
     storage: FlashTensorStorage,
-    device: torch.device,
-) -> None:
-    """Every rank reads its shard of each superwindow, then one AllGather per
-    window replicates it.
-
-    Total disk bytes stay one pack-read, but the read wall drops toward
-    ``read_time / world`` because the ranks read disjoint ranges concurrently --
-    which also multiplies the request parallelism the filesystem sees, the part
-    that matters most on a network FS whose cold throughput is per-client.
-
-    Replication uses AllGather rather than ``world`` owner-broadcasts: it is the
-    primitive for this pattern (every rank contributes one shard and receives
-    the rest), it is one op per window instead of ``world`` ops, and it is what
-    NCCL's copy-engine and NVLink-multicast fast paths are implemented for.
-
-    A rank whose read fails still issues the rest of its collectives before
-    raising, so a one-rank IO error surfaces as a synchronized exception instead
-    of leaving the other ranks blocked in a collective forever.
-    """
-    world = dist.get_world_size()
-    rank = dist.get_rank()
-    windows = _plan_windows(specs, world)
-
-    # Each rank's own shards, as sub-specs the existing reader can consume. Its
-    # chunk planner realigns to 4096 in *file* space (reading any sub-page head
-    # buffered), so a macroblock whose own offset_bytes is unaligned -- fp8
-    # static packs interleave a bf16 block ahead of the quantized one -- costs
-    # one short buffered read per shard rather than losing O_DIRECT.
+    world: int,
+    rank: int,
+    shard_bytes: int,
+) -> tuple[list[MacroblockSpec], list[torch.Tensor], list[_Window]]:
+    """This rank's shard of every superwindow, as sub-specs for the reader."""
+    windows = _plan_windows(specs, world, shard_bytes)
     sub_specs: list[MacroblockSpec] = []
     sub_blocks: list[torch.Tensor] = []
     for window in windows:
@@ -485,14 +519,43 @@ def _read_storage_sharded(
             )
         )
         sub_blocks.append(block.narrow(0, lo // elem, length // elem))
+    return sub_specs, sub_blocks, windows
 
-    read_error: BaseException | None = None
-    if sub_specs:
-        try:
-            parallel_read_into_storage(path, sub_specs, sub_blocks, device)
-        except BaseException as exc:  # noqa: BLE001 - re-raised, synchronized
-            read_error = exc
 
+def _sub_specs_contiguous(
+    specs: list[MacroblockSpec],
+    storage: FlashTensorStorage,
+    world: int,
+    rank: int,
+) -> tuple[list[MacroblockSpec], list[torch.Tensor]]:
+    """This rank's single contiguous 1/N of every block, as reader sub-specs."""
+    sub_specs: list[MacroblockSpec] = []
+    sub_blocks: list[torch.Tensor] = []
+    for spec, block in zip(specs, storage.blocks):
+        lo, hi = _shard_range(spec.length_bytes, world, rank)
+        if hi <= lo:
+            continue
+        elem = block.element_size()
+        sub_specs.append(
+            MacroblockSpec(
+                dtype=spec.dtype,
+                offset_bytes=spec.offset_bytes + lo,
+                length_bytes=hi - lo,
+                length_elems=(hi - lo) // elem,
+            )
+        )
+        sub_blocks.append(block.narrow(0, lo // elem, (hi - lo) // elem))
+    return sub_specs, sub_blocks
+
+
+def _replicate_windows(
+    windows: list[_Window],
+    storage: FlashTensorStorage,
+    world: int,
+    rank: int,
+    device: torch.device,
+) -> None:
+    """One in-place AllGather per superwindow, in window order on every rank."""
     inplace = _supports_inplace_allgather(device)
     for window in windows:
         if not window.shard_bytes:
@@ -503,6 +566,93 @@ def _read_storage_sharded(
         span = span.view(torch.uint8)
         shard = span.narrow(0, rank * window.shard_bytes, window.shard_bytes)
         _all_gather_into(span, shard if inplace else shard.clone())
+
+
+def _replicate_contiguous(
+    specs: list[MacroblockSpec],
+    storage: FlashTensorStorage,
+    world: int,
+) -> None:
+    """One async broadcast per (owner, block), in identical order on every rank."""
+    works = []
+    for src_rank in range(world):
+        for spec, block in zip(specs, storage.blocks):
+            lo, hi = _shard_range(spec.length_bytes, world, src_rank)
+            if hi <= lo:
+                continue
+            elem = block.element_size()
+            view = block.narrow(0, lo // elem, (hi - lo) // elem).view(torch.uint8)
+            works.append(dist.broadcast(view, src=src_rank, async_op=True))
+    for work in works:
+        work.wait()
+
+
+def _read_storage_sharded(
+    path: str,
+    specs: list[MacroblockSpec],
+    storage: FlashTensorStorage,
+    device: torch.device,
+    strategy: str | None = None,
+) -> None:
+    """Every rank reads its own 1/N of the payload, then it is replicated.
+
+    Total disk bytes stay one pack-read, but the read wall drops toward
+    ``read_time / world`` because the ranks read disjoint ranges concurrently --
+    which also multiplies the request parallelism the filesystem sees, the part
+    that matters most on a network FS whose cold throughput is per-client.
+
+    Two shapes, because which one wins is workload-dependent (see
+    ``SHARD_STRATEGY_*``):
+
+    ``contiguous``
+        one contiguous ``length/world`` slab per rank, replicated with ``world``
+        owner-broadcasts. Each rank issues one long sequential read per block.
+
+    ``windows``
+        interleaved superwindows -- rank ``r`` takes shard ``r`` of every
+        ``world * shard_bytes`` window -- replicated with one in-place AllGather
+        per window. Equal-sized shards are what make a single AllGather legal;
+        it is one collective per window instead of ``world``, and measured 1.15x
+        faster than the broadcasts at moving the same bytes. It also bounds the
+        bytes in flight per collective regardless of pack size.
+
+    On an 8x H200 node with a 14.5 GB fp8 pack the two are within noise
+    end-to-end (0.65 s vs 0.66 s) because the load is read-bound there; the
+    difference is expected to matter at other pack sizes, world sizes, and
+    fabrics, so both ship and either can be selected.
+
+    Either way, a rank whose read fails still issues the rest of its collectives
+    before raising, so a one-rank IO error surfaces as a synchronized exception
+    instead of leaving the other ranks blocked in a collective forever.
+    """
+    strategy = resolve_shard_strategy(strategy)
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+
+    # Sub-specs go through the existing reader, whose chunk planner realigns to
+    # 4096 in *file* space (reading any sub-page head buffered). So a macroblock
+    # whose own offset_bytes is unaligned -- fp8-static packs put a bf16 block
+    # ahead of the quantized one -- costs one short buffered read per shard
+    # rather than losing O_DIRECT.
+    windows: list[_Window] = []
+    if strategy == SHARD_STRATEGY_WINDOWS:
+        sub_specs, sub_blocks, windows = _sub_specs_windows(
+            specs, storage, world, rank, _shard_bytes_from_env()
+        )
+    else:
+        sub_specs, sub_blocks = _sub_specs_contiguous(specs, storage, world, rank)
+
+    read_error: BaseException | None = None
+    if sub_specs:
+        try:
+            parallel_read_into_storage(path, sub_specs, sub_blocks, device)
+        except BaseException as exc:  # noqa: BLE001 - re-raised, synchronized
+            read_error = exc
+
+    if strategy == SHARD_STRATEGY_WINDOWS:
+        _replicate_windows(windows, storage, world, rank, device)
+    else:
+        _replicate_contiguous(specs, storage, world)
 
     failed = torch.tensor(
         [1 if read_error is not None else 0], dtype=torch.int32, device=device
@@ -587,18 +737,23 @@ def read_flashpack_file_distributed(
     silent: bool = True,
     metadata: dict[str, Any] | None = None,
     sharded: bool = False,
+    shard_strategy: str | None = None,
 ) -> tuple[FlashTensorStorage, dict[str, Any]]:
     """Rank-``src`` reads the pack from disk; every rank returns the full
     storage, received via broadcast.
 
-    With ``sharded=True`` every rank instead reads its own 1/N of each
-    superwindow of each block, and one AllGather per window replicates it: the
-    same one-pack-read total, but the disk wall drops toward ``read / world``
-    because the ranks read disjoint ranges concurrently, and the replication
-    runs at fabric rather than filesystem rates. Requires every rank to be able
-    to read the pack payload from ``path`` (rank-``src`` mode only needs the
-    footer on non-src ranks). Falls back to rank-``src`` mode for packs with
-    compressed (fpz) blocks, whose on-disk bytes are not shard-addressable.
+    With ``sharded=True`` every rank instead reads its own 1/N of the payload
+    and the shards are replicated over the fabric: the same one-pack-read total,
+    but the disk wall drops toward ``read / world`` because the ranks read
+    disjoint ranges concurrently, and the replication runs at fabric rather than
+    filesystem rates. ``shard_strategy`` selects how -- ``"contiguous"`` (one
+    slab per rank, owner-broadcasts) or ``"windows"`` (interleaved superwindows,
+    one AllGather each); see ``_read_storage_sharded``. ``None`` takes
+    ``FLASHPACK_SHARD_STRATEGY``, else the package default. Requires every rank
+    to be able to read the pack payload from ``path`` (rank-``src`` mode only
+    needs the footer on non-src ranks). Falls back to rank-``src`` mode for
+    packs with compressed (fpz) blocks, whose on-disk bytes are not
+    shard-addressable.
 
     This removes the N-times read amplification of world-size-N loads: the
     reader deliberately bypasses the page cache (O_DIRECT), so without this
@@ -628,7 +783,7 @@ def read_flashpack_file_distributed(
     if sharded and dist.get_world_size() > 1:
         specs = _build_macroblock_specs(meta)
         storage = _allocate_empty_storage(specs, device)
-        _read_storage_sharded(path, specs, storage, device)
+        _read_storage_sharded(path, specs, storage, device, shard_strategy)
         return storage, meta
     if dist.get_rank() == src:
         storage, meta = read_flashpack_file(
@@ -752,6 +907,7 @@ def assign_from_file(
     ignore_suffixes: list[str] | None = None,
     use_distributed_loading: bool = False,
     distributed_sharded: bool = False,
+    distributed_shard_strategy: str | None = None,
     rank: int | None = None,
     local_rank: int | None = None,
     world_size: int | None = None,
@@ -761,8 +917,9 @@ def assign_from_file(
     Assign the weights from a flashpack file to a model.
 
     ``distributed_sharded=True`` (with ``use_distributed_loading=True``) makes
-    every rank read a 1/N shard instead of rank 0 reading the whole pack; see
-    ``read_flashpack_file_distributed``.
+    every rank read a 1/N shard instead of rank 0 reading the whole pack, and
+    ``distributed_shard_strategy`` selects how the payload is divided and
+    replicated; see ``read_flashpack_file_distributed``.
     """
     if device is None:
         try:
@@ -788,6 +945,7 @@ def assign_from_file(
             num_streams=num_streams,
             chunk_bytes=chunk_bytes,
             sharded=distributed_sharded,
+            shard_strategy=distributed_shard_strategy,
         )
     else:
         flash_storage, meta = read_flashpack_file(
