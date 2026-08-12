@@ -82,6 +82,23 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return os.environ.get(name, "1" if default else "0") != "0"
 
 
+def sharded_read_available() -> bool:
+    """Whether the sharded distributed read can run at all on this host.
+
+    The sharded path is built on the parallel reader (``os.preadv`` +
+    O_DIRECT), so it honors the same ``FLASHPACK_PARALLEL_READ=0`` kill switch
+    and POSIX requirement. It deliberately does NOT require the CPU eager
+    opt-in (``FLASHPACK_CPU_PARALLEL_READ``): that flag chooses eager-vs-mmap
+    for plain CPU loads, while a sharded read has no mmap alternative --
+    every rank must materialize its shard to broadcast it.
+
+    Callers must not branch on this per rank: the distributed entry point
+    resolves it on rank 0 and broadcasts the decision, so a kill switch set on
+    only some ranks cannot desynchronize the collective schedule.
+    """
+    return os.name == "posix" and _env_flag("FLASHPACK_PARALLEL_READ")
+
+
 def parallel_read_supported(device: torch.device) -> bool:
     """Whether the parallel reader applies to ``device`` (POSIX only).
 

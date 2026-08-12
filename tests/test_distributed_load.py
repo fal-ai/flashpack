@@ -16,13 +16,14 @@ works through the uint8 view.
 
 import os
 import sys
+import time
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from flashpack import deserialization
-from flashpack.constants import SHARD_STRATEGIES
+from flashpack.constants import DEFAULT_SHARD_STRATEGY, SHARD_STRATEGIES
 from flashpack.deserialization import (
     FlashTensorStorage,
     MacroblockSpec,
@@ -185,13 +186,16 @@ def test_shard_range_covers_disjoint_aligned() -> None:
                 assert hi % 4096 == 0 or hi == length
 
 
-def test_resolve_shard_strategy() -> None:
+def test_resolve_shard_strategy(monkeypatch) -> None:
     for name in SHARD_STRATEGIES:
         assert resolve_shard_strategy(name) == name
         assert resolve_shard_strategy(name.upper()) == name
-    assert resolve_shard_strategy(None) in SHARD_STRATEGIES
     with pytest.raises(ValueError, match="unknown shard strategy"):
         resolve_shard_strategy("sideways")
+    # the package default is pinned: flipping it is a deliberate decision that
+    # must show up in this test, not ride in silently with a refactor
+    monkeypatch.delenv("FLASHPACK_SHARD_STRATEGY", raising=False)
+    assert resolve_shard_strategy(None) == DEFAULT_SHARD_STRATEGY == "contiguous"
 
 
 def test_shard_strategy_env_override(monkeypatch) -> None:
@@ -311,10 +315,13 @@ def _staged_sharded_worker(rank: int, init_file: str, pack_path: str) -> None:
     try:
         # gloo (and NCCL) accept the in-place gather, so the staged path -- the
         # fallback for a backend that does not -- would otherwise never run.
-        # Force it and require byte-identical results from it too.
+        # Force it and require byte-identical results from it too. The probe
+        # is only consulted by the windows strategy, so it must be selected
+        # explicitly: with the package default (contiguous) this test would
+        # silently not exercise the staged branch at all.
         deserialization._supports_inplace_allgather = lambda device: False
         storage, meta = read_flashpack_file_distributed(
-            pack_path, device="cpu", sharded=True
+            pack_path, device="cpu", sharded=True, shard_strategy="windows"
         )
         got = dict(iterate_from_flash_tensor(storage, meta))
         for name, tensor in _sharded_source().items():
@@ -332,6 +339,115 @@ def test_read_sharded_staged_fallback_matches(tmp_path) -> None:
     mp.spawn(
         _staged_sharded_worker,
         args=(str(tmp_path / "rdv6"), pack),
+        nprocs=_WORLD,
+        join=True,
+    )
+
+
+def _faulting_worker(
+    rank: int, init_file: str, pack_path: str, fault: str, strategy: str
+) -> None:
+    """Rank 1 fails inside the synchronized envelope; both ranks must raise
+    together, quickly -- not leave rank 0 blocked in a collective until the
+    process-group timeout."""
+    _init(rank, init_file)
+    try:
+        if rank == 1:
+
+            def _boom(*args, **kwargs):
+                raise RuntimeError("injected fault (test)")
+
+            if fault == "read":
+                deserialization.parallel_read_into_storage = _boom
+            else:  # "alloc": the likeliest production failure (device OOM)
+                deserialization._allocate_empty_storage = _boom
+        start = time.monotonic()
+        try:
+            read_flashpack_file_distributed(
+                pack_path, device="cpu", sharded=True, shard_strategy=strategy
+            )
+        except RuntimeError as exc:
+            elapsed = time.monotonic() - start
+            if rank == 1:
+                assert "injected fault" in str(exc), f"rank 1 got {exc!r}"
+            else:
+                assert "failed on another rank" in str(exc), f"rank 0 got {exc!r}"
+            assert elapsed < 60, f"rank {rank} took {elapsed:.0f}s -- not synchronized"
+        else:
+            raise AssertionError(f"rank {rank}: load unexpectedly succeeded")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("strategy", SHARD_STRATEGIES)
+@pytest.mark.parametrize("fault", ["read", "alloc"])
+def test_sharded_one_rank_failure_is_synchronized(tmp_path, fault, strategy) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_sharded_source(), pack, None)
+    mp.spawn(
+        _faulting_worker,
+        args=(str(tmp_path / f"rdv7-{fault}-{strategy}"), pack, fault, strategy),
+        nprocs=_WORLD,
+        join=True,
+    )
+
+
+def _divergent_env_worker(rank: int, init_file: str, pack_path: str) -> None:
+    """Sharding knobs set on only one rank must not desynchronize the load:
+    rank 0's resolved config is broadcast and wins everywhere."""
+    if rank == 1:
+        os.environ["FLASHPACK_SHARD_STRATEGY"] = "windows"
+        os.environ["FLASHPACK_SHARD_BYTES"] = "8192"
+    _init(rank, init_file)
+    try:
+        storage, meta = read_flashpack_file_distributed(
+            pack_path, device="cpu", sharded=True
+        )
+        got = dict(iterate_from_flash_tensor(storage, meta))
+        for name, tensor in _sharded_source().items():
+            assert torch.equal(
+                got[name].view(torch.uint8), tensor.contiguous().view(torch.uint8)
+            ), f"rank {rank} {name} mismatch under divergent env"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sharded_divergent_env_does_not_desynchronize(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_sharded_source(), pack, None)
+    mp.spawn(
+        _divergent_env_worker,
+        args=(str(tmp_path / "rdv8"), pack),
+        nprocs=_WORLD,
+        join=True,
+    )
+
+
+def _kill_switch_worker(rank: int, init_file: str, pack_path: str) -> None:
+    """FLASHPACK_PARALLEL_READ=0 must reach the sharded path: the load falls
+    back to rank-src broadcast mode (and still returns correct bytes) instead
+    of silently keeping the parallel reader on."""
+    os.environ["FLASHPACK_PARALLEL_READ"] = "0"
+    _init(rank, init_file)
+    try:
+        storage, meta = read_flashpack_file_distributed(
+            pack_path, device="cpu", sharded=True
+        )
+        got = dict(iterate_from_flash_tensor(storage, meta))
+        for name, tensor in _sharded_source().items():
+            assert torch.equal(
+                got[name].view(torch.uint8), tensor.contiguous().view(torch.uint8)
+            ), f"rank {rank} {name} mismatch under kill switch"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sharded_respects_parallel_read_kill_switch(tmp_path) -> None:
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_sharded_source(), pack, None)
+    mp.spawn(
+        _kill_switch_worker,
+        args=(str(tmp_path / "rdv9"), pack),
         nprocs=_WORLD,
         join=True,
     )
