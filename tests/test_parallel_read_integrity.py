@@ -17,6 +17,7 @@ CUDA pipeline against the legacy reader on GPU hosts (marked ``gpu``).
 """
 
 import os
+import time
 from contextlib import contextmanager
 
 import numpy as np
@@ -94,6 +95,34 @@ def cpu_parallel_read(monkeypatch):
     monkeypatch.setenv("FLASHPACK_READ_THREADS", "4")
     monkeypatch.setenv("FLASHPACK_READ_CHUNK_BYTES", "8192")
     return monkeypatch
+
+
+@pytest.fixture()
+def fake_cuda_parallel_read(monkeypatch):
+    """Exercise CUDA reader orchestration with CPU destination tensors."""
+    growth: list[int] = []
+
+    def fake_pool(n_threads: int, chunk_bytes: int) -> list:
+        return [[torch.empty(chunk_bytes, dtype=torch.uint8)] for _ in range(n_threads)]
+
+    def fake_grow(pool: list, n_threads: int, chunk_bytes: int) -> None:
+        growth.append(n_threads)
+        pool.extend(
+            [torch.empty(chunk_bytes, dtype=torch.uint8)]
+            for _ in range(n_threads - len(pool))
+        )
+
+    monkeypatch.setattr(parallel_read.torch, "cuda", _FakeCuda)
+    monkeypatch.setattr(parallel_read, "_get_pinned_pool", fake_pool)
+    monkeypatch.setattr(parallel_read, "_grow_pinned_pool", fake_grow)
+    monkeypatch.setenv("FLASHPACK_READ_THREADS", "16")
+    monkeypatch.setenv("FLASHPACK_RAMP_THREADS", "32")
+    monkeypatch.setenv("FLASHPACK_READ_CHUNK_BYTES", "4096")
+    monkeypatch.setenv("FLASHPACK_DIRECT_IO", "1")
+    monkeypatch.setenv("FLASHPACK_CONDITIONAL_RAMP", "1")
+    monkeypatch.setattr(parallel_read.os, "O_DIRECT", 0, raising=False)
+    monkeypatch.setattr(parallel_read, "_page_cache_resident_fraction", lambda *_: 0.0)
+    return monkeypatch, growth
 
 
 def _make_file(
@@ -318,6 +347,97 @@ class TestErrorsNeverSilent:
         finally:
             os.close(fd_plain)
             os.close(fd_direct)
+
+
+@posix_only
+class TestConditionalRamp:
+    def test_slow_real_reads_ramp_without_probe_io(
+        self, tmp_path, fake_cuda_parallel_read
+    ) -> None:
+        monkeypatch, growth = fake_cuda_parallel_read
+        monkeypatch.setenv("FLASHPACK_RAMP_THRESHOLD_S", "0.001")
+        real_read_chunk = parallel_read._read_chunk
+        read_calls = 0
+
+        def slow_read_chunk(*args, **kwargs):
+            nonlocal read_calls
+            real_read_chunk(*args, **kwargs)
+            read_calls += 1
+            time.sleep(0.005)
+
+        monkeypatch.setattr(parallel_read, "_read_chunk", slow_read_chunk)
+        specs = [_uint8_spec(0, 64 * 4096)]
+        path, data = _make_file(tmp_path, specs)
+        blocks = [torch.zeros(specs[0].length_bytes, dtype=torch.uint8)]
+
+        parallel_read_into_storage(path, specs, blocks, torch.device("cuda"))
+
+        assert bytes(blocks[0].numpy()) == data
+        assert growth == [32]
+        assert read_calls == len(_plan_chunks(specs, 4096))
+
+    def test_fast_real_reads_do_not_allocate_extra_buffers(
+        self, tmp_path, fake_cuda_parallel_read
+    ) -> None:
+        monkeypatch, growth = fake_cuda_parallel_read
+        monkeypatch.setenv("FLASHPACK_RAMP_THRESHOLD_S", "60")
+        specs = [_uint8_spec(0, 64 * 4096)]
+        path, data = _make_file(tmp_path, specs)
+        blocks = [torch.zeros(specs[0].length_bytes, dtype=torch.uint8)]
+
+        parallel_read_into_storage(path, specs, blocks, torch.device("cuda"))
+
+        assert bytes(blocks[0].numpy()) == data
+        assert growth == []
+
+    def test_page_cache_hot_load_bypasses_ramp(
+        self, tmp_path, fake_cuda_parallel_read
+    ) -> None:
+        monkeypatch, growth = fake_cuda_parallel_read
+        monkeypatch.setenv("FLASHPACK_RAMP_THRESHOLD_S", "0")
+        monkeypatch.setattr(
+            parallel_read, "_page_cache_resident_fraction", lambda *_: 1.0
+        )
+        specs = [_uint8_spec(0, 64 * 4096)]
+        path, data = _make_file(tmp_path, specs)
+        blocks = [torch.zeros(specs[0].length_bytes, dtype=torch.uint8)]
+
+        parallel_read_into_storage(path, specs, blocks, torch.device("cuda"))
+
+        assert bytes(blocks[0].numpy()) == data
+        assert growth == []
+
+    def test_small_load_never_allocates_ramp_pool(
+        self, tmp_path, fake_cuda_parallel_read
+    ) -> None:
+        monkeypatch, growth = fake_cuda_parallel_read
+        monkeypatch.setenv("FLASHPACK_RAMP_THRESHOLD_S", "0")
+        specs = [_uint8_spec(0, 32 * 4096)]
+        path, data = _make_file(tmp_path, specs)
+        blocks = [torch.zeros(specs[0].length_bytes, dtype=torch.uint8)]
+
+        parallel_read_into_storage(path, specs, blocks, torch.device("cuda"))
+
+        assert bytes(blocks[0].numpy()) == data
+        assert growth == []
+
+    def test_ramp_allocation_failure_falls_back_to_base_readers(
+        self, tmp_path, fake_cuda_parallel_read
+    ) -> None:
+        monkeypatch, _ = fake_cuda_parallel_read
+        monkeypatch.setenv("FLASHPACK_RAMP_THRESHOLD_S", "0")
+
+        def fail_grow(*args, **kwargs):
+            raise RuntimeError("simulated pinned-memory pressure")
+
+        monkeypatch.setattr(parallel_read, "_grow_pinned_pool", fail_grow)
+        specs = [_uint8_spec(0, 64 * 4096)]
+        path, data = _make_file(tmp_path, specs)
+        blocks = [torch.zeros(specs[0].length_bytes, dtype=torch.uint8)]
+
+        parallel_read_into_storage(path, specs, blocks, torch.device("cuda"))
+
+        assert bytes(blocks[0].numpy()) == data
 
 
 class TestPlanChunksFuzz:

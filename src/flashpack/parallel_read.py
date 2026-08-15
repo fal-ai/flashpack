@@ -39,6 +39,9 @@ Tunables (environment):
 - ``FLASHPACK_CPU_PARALLEL_READ=1``  enable eager parallel reads for CPU targets
 - ``FLASHPACK_READ_THREADS``         reader threads (default 16)
 - ``FLASHPACK_READ_CHUNK_BYTES``     chunk size (default 64 MiB)
+- ``FLASHPACK_CONDITIONAL_RAMP=0``   disable slow direct-read ramp
+- ``FLASHPACK_RAMP_THREADS``         ramp target (default 32)
+- ``FLASHPACK_RAMP_THRESHOLD_S``     first-read threshold (default 0.2 s)
 - ``FLASHPACK_DIRECT_IO=0``          never use O_DIRECT
 - ``FLASHPACK_CACHE_PINNED=0``       free pinned staging buffers after load (CUDA)
 """
@@ -48,6 +51,7 @@ import mmap as mmap_module
 import os
 import queue
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -65,8 +69,11 @@ __all__ = [
 ]
 
 _ALIGN = 4096
-_BUFFERS_PER_THREAD = 2
+_BUFFERS_PER_THREAD = 1
 _DEFAULT_READ_THREADS = 16
+_DEFAULT_RAMP_THREADS = 32
+_DEFAULT_RAMP_THRESHOLD_SECONDS = 0.2
+_RAMP_DECISION_READS = 4
 
 _POSIX_FADV_DONTNEED = 4
 
@@ -74,6 +81,13 @@ _POSIX_FADV_DONTNEED = 4
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
     except ValueError:
         return default
 
@@ -122,17 +136,26 @@ def parallel_read_supported(device: torch.device) -> bool:
 
 # Pinned staging memory is expensive to allocate (~0.5 s/GB), so the pool is
 # kept for the process lifetime by default: model servers load all their
-# packs back-to-back at startup and the pool (threads x 2 x chunk, 2 GiB at
-# defaults) amortizes across them. Set FLASHPACK_CACHE_PINNED=0 or call
+# packs back-to-back at startup and the initial pool (threads x chunk, 1 GiB at
+# defaults) amortizes across them. Slow large reads can grow it to 2 GiB. One
+# buffer per thread still overlaps I/O and H2D across reader threads while
+# halving the warm first-load pinning cost. Set
+# FLASHPACK_CACHE_PINNED=0 or call
 # release_pinned_pool() to free it.
 _PINNED_POOL: dict = {}
 _PINNED_POOL_LOCK = threading.Lock()
 
 
 def _get_pinned_pool(n_threads: int, chunk_bytes: int) -> list:
-    key = (n_threads, chunk_bytes)
     with _PINNED_POOL_LOCK:
-        pool = _PINNED_POOL.get(key)
+        pool = next(
+            (
+                cached
+                for (cached_threads, cached_bytes), cached in _PINNED_POOL.items()
+                if cached_bytes == chunk_bytes and cached_threads >= n_threads
+            ),
+            None,
+        )
         if pool is None:
             pool = [
                 [
@@ -142,8 +165,25 @@ def _get_pinned_pool(n_threads: int, chunk_bytes: int) -> list:
                 for _ in range(n_threads)
             ]
             _PINNED_POOL.clear()  # hold at most one pool
-            _PINNED_POOL[key] = pool
+            _PINNED_POOL[(n_threads, chunk_bytes)] = pool
         return pool
+
+
+def _grow_pinned_pool(pool: list, n_threads: int, chunk_bytes: int) -> None:
+    """Grow the active pool in place so existing readers keep their buffers."""
+    with _PINNED_POOL_LOCK:
+        if len(pool) >= n_threads:
+            return
+        extra = [
+            [
+                torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True)
+                for _ in range(_BUFFERS_PER_THREAD)
+            ]
+            for _ in range(n_threads - len(pool))
+        ]
+        pool.extend(extra)
+        _PINNED_POOL.clear()
+        _PINNED_POOL[(n_threads, chunk_bytes)] = pool
 
 
 def release_pinned_pool() -> None:
@@ -348,7 +388,7 @@ def parallel_read_into_storage(
 
     # IO-bound path: threads are the IO queue depth, so the affinity clamp
     # floors at the default -- only oversubscribed requests get capped.
-    n_threads = effective_read_threads(
+    base_threads = effective_read_threads(
         _env_int("FLASHPACK_READ_THREADS", _DEFAULT_READ_THREADS),
         floor=_DEFAULT_READ_THREADS,
     )
@@ -369,10 +409,9 @@ def parallel_read_into_storage(
     for chunk in chunks:
         work.put(chunk)
     n_chunks = len(chunks)
+    payload_bytes = sum(chunk[3] for chunk in chunks)
 
-    n_threads = min(n_threads, max(1, n_chunks))
-    for _ in range(n_threads):
-        work.put(None)
+    base_threads = min(base_threads, max(1, n_chunks))
 
     size = os.path.getsize(path)
     use_direct = (
@@ -383,10 +422,39 @@ def parallel_read_into_storage(
         and _page_cache_resident_fraction(path, size) < 0.9
     )
 
-    pool = _get_pinned_pool(n_threads, chunk_bytes)
+    ramp_threads = effective_read_threads(
+        _env_int("FLASHPACK_RAMP_THREADS", _DEFAULT_RAMP_THREADS),
+        # Like the base floor, this is I/O queue depth rather than a CPU
+        # worker budget. Preserve the default ramp even on small cpusets.
+        floor=_DEFAULT_RAMP_THREADS,
+    )
+    max_threads = min(max(base_threads, ramp_threads), max(1, n_chunks))
+    can_ramp = (
+        use_direct
+        and _env_flag("FLASHPACK_CONDITIONAL_RAMP")
+        and max_threads > base_threads
+        # Do not allocate another pinned pool for a small tail of work. At
+        # defaults this limits the ramp to payloads of at least 4 GiB.
+        and payload_bytes >= 2 * max_threads * chunk_bytes
+    )
+    for _ in range(max_threads if can_ramp else base_threads):
+        work.put(None)
+
+    pool = _get_pinned_pool(base_threads, chunk_bytes)
     errors: list[BaseException] = []
+    completed_reads = 0
+    progress_lock = threading.Lock()
+    ramp_decision = threading.Event()
+    should_ramp = False
+    decision_reads = min(_RAMP_DECISION_READS, n_chunks)
+    ramp_threshold = max(
+        0.0,
+        _env_float("FLASHPACK_RAMP_THRESHOLD_S", _DEFAULT_RAMP_THRESHOLD_SECONDS),
+    )
+    read_started = time.perf_counter()
 
     def _reader(thread_idx: int) -> None:
+        nonlocal completed_reads, should_ramp
         try:
             fd_plain = os.open(path, os.O_RDONLY)
             fd_direct = None
@@ -419,6 +487,14 @@ def parallel_read_into_storage(
                     i += 1
                     ev.synchronize()  # buffer's previous H2D must be done
                     _read_chunk(fd_direct, fd_plain, view, f_off, ln)
+                    if can_ramp:
+                        with progress_lock:
+                            completed_reads += 1
+                            if completed_reads == decision_reads:
+                                should_ramp = (
+                                    time.perf_counter() - read_started >= ramp_threshold
+                                )
+                                ramp_decision.set()
                     with torch.cuda.stream(stream):
                         byte_views[blk].narrow(0, b_off, ln).copy_(
                             buf.narrow(0, 0, ln), non_blocking=True
@@ -434,12 +510,43 @@ def parallel_read_into_storage(
 
     threads = [
         threading.Thread(target=_reader, args=(i,), daemon=True)
-        for i in range(n_threads)
+        for i in range(base_threads)
     ]
+    extra_threads: list[threading.Thread] = []
+
+    def _ramp_controller() -> None:
+        ramp_decision.wait()
+        if not should_ramp or errors:
+            return
+        try:
+            _grow_pinned_pool(pool, max_threads, chunk_bytes)
+        except (MemoryError, RuntimeError):
+            # Ramping is optional: retain the working base readers if the
+            # host cannot pin the additional staging memory.
+            return
+        for i in range(base_threads, max_threads):
+            thread = threading.Thread(target=_reader, args=(i,), daemon=True)
+            try:
+                thread.start()
+            except RuntimeError:
+                break
+            extra_threads.append(thread)
+
+    controller = (
+        threading.Thread(target=_ramp_controller, daemon=True) if can_ramp else None
+    )
+    if controller is not None:
+        controller.start()
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    if controller is not None:
+        # An early read failure can prevent the completion threshold.
+        ramp_decision.set()
+        controller.join()
+        for t in extra_threads:
+            t.join()
     torch.cuda.synchronize(device)
     if not _env_flag("FLASHPACK_CACHE_PINNED"):
         release_pinned_pool()
