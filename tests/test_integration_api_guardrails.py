@@ -11,11 +11,12 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _function(path: str, name: str, *, class_name: str | None = None) -> ast.FunctionDef:
+def _function(
+    path: str, name: str, *, class_name: str | None = None
+) -> ast.FunctionDef:
     tree = ast.parse((ROOT / path).read_text())
     body: list[ast.stmt] = tree.body
     if class_name is not None:
@@ -26,9 +27,7 @@ def _function(path: str, name: str, *, class_name: str | None = None) -> ast.Fun
         )
         body = cls.body
     return next(
-        node
-        for node in body
-        if isinstance(node, ast.FunctionDef) and node.name == name
+        node for node in body if isinstance(node, ast.FunctionDef) and node.name == name
     )
 
 
@@ -37,7 +36,9 @@ def _keyword_names(function: ast.FunctionDef, called_name: str) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        name = (
+            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        )
         if name == called_name:
             return {kw.arg for kw in node.keywords if kw.arg is not None}
     raise AssertionError(f"call to {called_name} not found in {function.name}")
