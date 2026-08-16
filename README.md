@@ -109,6 +109,18 @@ storage, metadata = flashpack.read_flashpack_file_distributed(
 )
 ```
 
+The same paths are available from the model integrations, for ordinary BF16,
+FP32, and quantized packs alike:
+
+```py
+model = MyFlashPackModel.from_pretrained_flashpack(
+    "/path/to/repository",
+    device="cuda",
+    use_distributed_loading=True,
+    distributed_sharded=True,  # omit for rank-0 read + broadcast
+)
+```
+
 Two shard replication strategies ship (`contiguous` slabs with owner broadcasts, and
 interleaved `windows` moved with one AllGather each); both are checksummed and
 benchmarked in `scripts/bench_distributed_shard_strategy.py` — measure on your own

@@ -106,6 +106,8 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
         force_download: bool = False,
         proxies: dict[str, str] | None = None,
         use_distributed_loading: bool = False,
+        distributed_sharded: bool = False,
+        distributed_shard_strategy: str | None = None,
         rank: int | None = None,
         local_rank: int | None = None,
         world_size: int | None = None,
@@ -187,6 +189,8 @@ class FlashPackTransformersModelMixin(PreTrainedModel, FlashPackMixin):
             local_rank=local_rank,
             world_size=world_size,
             use_distributed_loading=use_distributed_loading,
+            distributed_sharded=distributed_sharded,
+            distributed_shard_strategy=distributed_shard_strategy,
             coerce_dtype=coerce_dtype,
             **kwargs,
         )
