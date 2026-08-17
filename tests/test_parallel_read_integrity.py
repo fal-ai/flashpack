@@ -119,6 +119,7 @@ def fake_cuda_parallel_read(monkeypatch):
     monkeypatch.setenv("FLASHPACK_RAMP_THREADS", "32")
     monkeypatch.setenv("FLASHPACK_READ_CHUNK_BYTES", "4096")
     monkeypatch.setenv("FLASHPACK_DIRECT_IO", "1")
+    monkeypatch.setenv("FLASHPACK_SAMPLE_PROBE", "0")
     monkeypatch.setenv("FLASHPACK_CONDITIONAL_RAMP", "1")
     monkeypatch.setattr(parallel_read.os, "O_DIRECT", 0, raising=False)
     monkeypatch.setattr(parallel_read, "_page_cache_resident_fraction", lambda *_: 0.0)
