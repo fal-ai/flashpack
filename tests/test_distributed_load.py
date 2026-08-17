@@ -32,6 +32,7 @@ from flashpack.deserialization import (
     _shard_range,
     assign_from_file,
     iterate_from_flash_tensor,
+    read_flashpack_file,
     read_flashpack_file_distributed,
     resolve_shard_strategy,
 )
@@ -482,5 +483,134 @@ def test_assign_from_file_distributed_sharded(tmp_path, strategy) -> None:
         _assign_sharded_worker,
         args=(str(tmp_path / f"rdv5-{strategy}"), pack, strategy),
         nprocs=_WORLD,
+        join=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# World sizes beyond 2
+#
+# Everything above runs at ``_WORLD = 2``, but the shipping shape for this path
+# is an 8-GPU node -- and world size is not a free parameter of the sharded
+# reader. It sets the shard plan (``_shard_range`` / ``_plan_windows``), how
+# many ranks fall off the end of a short block with an empty shard, and how many
+# collectives ``_replicate_contiguous`` issues per block. At world 2 a block
+# only ever splits into "rank 0 takes it all" or "one shard each": the interior
+# ranks that exist only at larger worlds, and the geometric shard step-down in
+# ``_plan_windows``, are never exercised end to end.
+#
+# These stay on gloo/CPU like the rest of the module, so the extra ranks cost
+# processes rather than GPUs.
+_LARGE_WORLD = 8
+
+
+def _init_world(rank: int, init_file: str, world: int) -> None:
+    os.environ.setdefault(
+        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
+    )
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world
+    )
+
+
+def _world_source() -> dict[str, torch.Tensor]:
+    """Blocks chosen so one pack hits every shard shape a large world produces."""
+    g = torch.Generator().manual_seed(23)
+    state = {
+        # >= world * SHARD_ALIGN_BYTES: every rank owns a real shard.
+        "wide.bf16": torch.randn(8192, 512, generator=g).to(torch.bfloat16),
+        # Not a multiple of world * align, so the last rank's shard runs long
+        # and 'windows' has to step its shard size down for the remainder.
+        "ragged.fp32": torch.randn(9973, 31, generator=g),
+        # Smaller than world * align: only the low ranks get bytes, so the high
+        # ranks must skip the block identically or the collective sequence
+        # desynchronizes and the job hangs instead of failing.
+        "short.fp32": torch.randn(97, generator=g),
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        state["q.fp8"] = torch.randn(8192, 64, generator=g).to(torch.float8_e4m3fn)
+    return state
+
+
+def _read_world_worker(
+    rank: int, init_file: str, pack_path: str, strategy: str, world: int
+) -> None:
+    _init_world(rank, init_file, world)
+    try:
+        storage, meta = read_flashpack_file_distributed(
+            pack_path, device="cpu", sharded=True, shard_strategy=strategy
+        )
+        got = dict(iterate_from_flash_tensor(storage, meta))
+        state = _world_source()
+        assert set(got) == set(state)
+        for name, tensor in state.items():
+            assert torch.equal(
+                got[name].view(torch.uint8), tensor.contiguous().view(torch.uint8)
+            ), f"world {world} rank {rank} {name} mismatch"
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("strategy", SHARD_STRATEGIES)
+def test_sharded_read_is_byte_exact_at_world_8(tmp_path, strategy) -> None:
+    """Every rank of an 8-way job must end up with the whole payload."""
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_world_source(), pack, None)
+    mp.spawn(
+        _read_world_worker,
+        args=(str(tmp_path / f"rdv-w8-{strategy}"), pack, strategy, _LARGE_WORLD),
+        nprocs=_LARGE_WORLD,
+        join=True,
+    )
+
+
+def _mode_parity_worker(rank: int, init_file: str, pack_path: str, world: int) -> None:
+    _init_world(rank, init_file, world)
+    try:
+        reference: dict[str, torch.Tensor] | None = None
+        for label, kwargs in (
+            ("whole-pack", None),
+            ("broadcast", {"sharded": False}),
+            ("sharded/contiguous", {"sharded": True, "shard_strategy": "contiguous"}),
+            ("sharded/windows", {"sharded": True, "shard_strategy": "windows"}),
+        ):
+            if kwargs is None:
+                storage, meta = read_flashpack_file(pack_path, device="cpu")
+            else:
+                storage, meta = read_flashpack_file_distributed(
+                    pack_path, device="cpu", **kwargs
+                )
+            payload = {
+                name: tensor.contiguous().view(torch.uint8).clone()
+                for name, tensor in iterate_from_flash_tensor(storage, meta)
+            }
+            if reference is None:
+                reference = payload
+                continue
+            assert set(payload) == set(reference)
+            for name, block in payload.items():
+                assert torch.equal(
+                    block, reference[name]
+                ), f"rank {rank}: {label} differs from a whole-pack read at {name}"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_all_read_modes_agree_byte_for_byte(tmp_path) -> None:
+    """The four read paths are interchangeable, and that is a testable claim.
+
+    Choosing ``use_distributed_loading`` / ``distributed_sharded`` picks how the
+    bytes reach the device, never which bytes arrive. Reading one pack every way
+    inside a single process and requiring identical output states that contract
+    outright, so a regression in any one path surfaces here as a diff against
+    the other three -- rather than downstream, as a numerical mystery in
+    whichever model happens to load it.
+    """
+    pack = str(tmp_path / "pack.flashpack")
+    pack_to_file(_world_source(), pack, None)
+    mp.spawn(
+        _mode_parity_worker,
+        args=(str(tmp_path / "rdv-parity"), pack, _LARGE_WORLD),
+        nprocs=_LARGE_WORLD,
         join=True,
     )
