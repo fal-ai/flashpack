@@ -116,6 +116,21 @@ fabric before overriding the default. On an 8&times;H200 node a 14.5 GB fp8 pack
 in ~0.65 s sharded, with the fabric moving 12.9 GB of replication in ~32&ndash;37 ms
 depending on strategy.
 
+**Every read mode delivers the same bytes.** `sharded` and `use_distributed_loading`
+choose how the payload reaches the device, never which payload arrives, and
+`test_all_read_modes_agree_byte_for_byte` pins that across all four paths on 8 ranks.
+This matters when triage goes the other way: a distributed load is a tempting suspect
+for a CUDA fault that shows up later in a model, and confirming or clearing it takes
+minutes, not a bisect on real hardware —
+
+1. Read the same pack with `sharded=True`, with `sharded=False`, and with plain
+   `read_flashpack_file`, then `torch.equal` the storages on every rank. Different
+   bytes are a flashpack bug; identical bytes clear the reader entirely.
+2. If they match, build the model and diff its parameters against whatever loader you
+   are replacing. Any parameter left on `meta` is a packing gap, not a read bug.
+3. Only then look at the caller. A fault that also reproduces with
+   `distributed_sharded=False` — or with flashpack removed — was never the read.
+
 ## Tuning
 
 The main knobs are environment variables; the defaults are the measured sweet spots
