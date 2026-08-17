@@ -99,9 +99,11 @@ class TestSupported:
         monkeypatch.setenv("FLASHPACK_PARALLEL_READ", "0")
         assert not parallel_read_supported(torch.device("cuda"))
 
-    def test_cuda_posix_default_on(self, monkeypatch) -> None:
+    def test_cuda_default_on(self, monkeypatch) -> None:
+        # No platform gating: the engine targets fal's Linux runners, and
+        # the only global switch is FLASHPACK_PARALLEL_READ.
         monkeypatch.delenv("FLASHPACK_PARALLEL_READ", raising=False)
-        assert parallel_read_supported(torch.device("cuda")) == (os.name == "posix")
+        assert parallel_read_supported(torch.device("cuda"))
 
     def test_cpu_never(self, monkeypatch) -> None:
         monkeypatch.delenv("FLASHPACK_PARALLEL_READ", raising=False)

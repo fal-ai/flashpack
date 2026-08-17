@@ -116,7 +116,7 @@ def sharded_read_available() -> bool:
 
 
 def parallel_read_supported(device: torch.device) -> bool:
-    """Whether the parallel reader applies to ``device`` (POSIX only).
+    """Whether the parallel reader applies to ``device``.
 
     CUDA targets use it by default (``FLASHPACK_PARALLEL_READ=0`` disables).
     CPU targets are opt-in via ``FLASHPACK_CPU_PARALLEL_READ=1``: the default
@@ -127,7 +127,7 @@ def parallel_read_supported(device: torch.device) -> bool:
     right choice when the weights will all be read anyway (serving), but it
     trades away mmap laziness — hence opt-in.
     """
-    if os.name != "posix" or not _env_flag("FLASHPACK_PARALLEL_READ"):
+    if not _env_flag("FLASHPACK_PARALLEL_READ"):
         return False
     if device.type == "cuda":
         return True
@@ -455,6 +455,19 @@ def parallel_read_into_storage(
     allocation the legacy path uses). Raises on any integrity error; never
     returns partially-filled storage silently.
     """
+    # Settle any background prefetch of this file before choosing an I/O
+    # path: finished warms leave a hot cache for the mincore gate to route
+    # onto buffered reads; in-flight warms are waited on (nearly resident)
+    # or cancelled (barely started) — never raced for bandwidth. Only THIS
+    # reader settles: the lazy-mmap CPU path and the legacy CUDA mmap walk
+    # read buffered through the page cache, so a warm running ahead of
+    # them only helps — the race is specific to O_DIRECT, which bypasses
+    # the cache the warm populates. Late import: prefetch.py imports this
+    # module at module level.
+    from .prefetch import settle_prefetch
+
+    settle_prefetch(path)
+
     if device.type == "cpu":
         _parallel_read_into_cpu_storage(path, specs, blocks)
         return
