@@ -498,3 +498,32 @@ def test_parallel_matches_legacy_on_cuda(tmp_path, monkeypatch) -> None:
         assert torch.equal(
             parallel_block.view(torch.uint8), legacy_block.view(torch.uint8)
         )
+
+
+_NO_STRAY_CONTEXT_SCRIPT = """
+import sys, torch
+from flashpack.deserialization import read_flashpack_file
+from flashpack.serialization import pack_to_file
+
+torch.cuda.set_device(1)
+pack_to_file({"w": torch.randn(4_000_000)}, sys.argv[1], target_dtype=None)
+read_flashpack_file(sys.argv[1], device="cuda:1")
+print(int(torch._C._cuda_hasPrimaryContext(0)))
+"""
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_reader_threads_create_no_context_on_device_zero(tmp_path) -> None:
+    """Reading onto cuda:1 must not open a CUDA context on cuda:0."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", _NO_STRAY_CONTEXT_SCRIPT, str(tmp_path / "w.fp")],
+        env={**os.environ, "FLASHPACK_PARALLEL_READ": "1"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "0"
