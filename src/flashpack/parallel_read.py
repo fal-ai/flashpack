@@ -521,10 +521,15 @@ def parallel_read_into_storage(
         _env_float("FLASHPACK_RAMP_THRESHOLD_S", _DEFAULT_RAMP_THRESHOLD_SECONDS),
     )
     read_started = time.perf_counter()
+    # New threads start on cuda:0, and leaving ``torch.cuda.stream`` switches a
+    # reader back to it, creating a CUDA context on GPU 0 in every rank's process.
+    reader_device = blocks[0].device if blocks else device
 
     def _reader(thread_idx: int) -> None:
         nonlocal completed_reads, should_ramp
         try:
+            if reader_device.index is not None:
+                torch.cuda.set_device(reader_device)
             fd_plain = os.open(path, os.O_RDONLY)
             fd_direct = None
             if use_direct:
