@@ -48,10 +48,8 @@ from diffusers.pipelines.pipeline_loading_utils import (
     LOADABLE_CLASSES,
     TRANSFORMERS_DUMMY_MODULES_FOLDER,
     _get_final_device_map,
-    _get_load_method,
     _get_pipeline_class,
     _identify_model_variants,
-    _maybe_raise_error_for_incorrect_transformers,
     _maybe_raise_warning_for_inpainting,
     _maybe_warn_for_wrong_component_in_quant_config,
     _resolve_custom_pipeline_and_cls,
@@ -63,6 +61,22 @@ from diffusers.pipelines.pipeline_loading_utils import (
     remove_hook_from_module,
 )
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+
+try:
+    # diffusers < 0.41: DDUF-aware resolution of a component's loader
+    from diffusers.pipelines.pipeline_loading_utils import (
+        _get_load_method,
+        _maybe_raise_error_for_incorrect_transformers,
+    )
+except ImportError:
+    # diffusers >= 0.41 dropped DDUF loading and inlined both helpers
+
+    def _get_load_method(class_obj: Any, load_method_name: str, is_dduf: bool) -> Any:
+        return getattr(class_obj, load_method_name)
+
+    def _maybe_raise_error_for_incorrect_transformers(config_dict: dict) -> None:
+        return None
+
 
 if is_accelerate_available():
     pass
