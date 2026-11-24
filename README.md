@@ -224,6 +224,19 @@ pack_to_file(model, flashpack_path, None)  # write state dict to file (None keep
 assign_from_file(model, flashpack_path)  # load state dict from file
 ```
 
+After layer replacement, surviving tensors can keep large packed
+allocations alive. Compact them before compilation, optimizer creation or keeping
+external tensor references:
+
+```py
+from flashpack import compact
+
+released_bytes = compact(model)
+```
+
+This replaces plain registered tensors while preserving values, strides, shared
+views and tied registrations. The return value is their storage reduction in bytes.
+
 ## CLI Commands
 
 FlashPack provides a command-line interface for converting, inspecting, and reverting flashpack files.

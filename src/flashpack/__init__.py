@@ -1,3 +1,4 @@
+from .compaction import compact
 from .deserialization import (
     assign_from_file,
     get_flashpack_file_metadata,
@@ -18,6 +19,7 @@ from .version import (
 
 __all__ = [
     "FlashPackMixin",
+    "compact",
     "patch_integrations",
     "assign_from_file",
     "is_flashpack_file",
